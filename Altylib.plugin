@@ -1,0 +1,1214 @@
+import copy
+import time
+import json
+import os.path
+import threading
+import traceback
+from dataclasses import dataclass, asdict
+from typing import List, Callable, Optional, Any
+
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Input
+from base_plugin import BasePlugin, MethodHook
+from android_utils import log as logcat, run_on_ui_thread
+from client_utils import get_messages_controller, send_request, get_file_loader, get_last_fragment, run_on_queue
+from ui.alert import AlertDialogBuilder
+
+from java import dynamic_proxy, cast
+from org.telegram.tgnet import TLRPC
+from org.telegram.messenger import Utilities, FileLoader
+from com.exteragram.messenger.utils import ChatUtils
+from com.exteragram.messenger.plugins import PluginsController
+from hook_utils import find_class
+
+# плагин вдохновлен zwylib, но дает больше функций, все функции присутствующие в zwylib присутствуют и в этом плагине
+
+__name__ = "AltyLib"
+__description__ = "AltyPlugins library with highly used things"
+__icon__ = "AltyPlugIcons/1"
+__id__ = "altylib"
+__version__ = "1.0.3"
+__author__ = "@altyplugins"
+__min_version__ = "11.9.1"
+__all__ = (
+    "add_autoupdater_task", "remove_autoupdater_task", "JsonCacheFile", #autoupdater task management
+    "detect_client", "detect_language", #detect client and language of the client
+    "hide_my_commands", #hide commands of the plugin from comlist
+    "shared_set", "shared_get", "shared_delete", "shared_all", #shared data between plugins
+    "get_plugins_dirs", #get plugin locations
+    "get_current_activity", "bulletin_info", "bulletin_error", "bulletin_success", #bulletin helpers
+    "show_spinner", "hide_spinner", #spinner dialog helpers
+    "add_tg_alias", "remove_tg_alias", # custom tg:// scheme aliases 
+    "get_logs", "clear_logs", # retrieve / clear recent AltyLib log lines
+    "events_subscribe", "events_unsubscribe", "events_publish", # event bus
+    "register_command", "handle_outgoing_command", "get_registered_commands", # command manager
+    "tasks_schedule", "tasks_cancel", "tasks_list", # task scheduler
+    "rpc_register", "rpc_call" # intra-plugin RPC
+)
+
+
+class Callback1(dynamic_proxy(Utilities.Callback)):
+    def __init__(self, fn: Callable[[Any], None]):
+        super().__init__()
+        self._fn = fn
+
+    def run(self, arg):
+        try:
+            self._fn(arg)
+        except Exception:
+            log(f"Error in Callback1: {traceback.format_exc().rstrip()}")
+
+
+class JsonCacheFile:
+    cache_dir_name = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cache")
+
+    def __init__(self, filename: str, default: Any, read_on_init = True):
+        self.filename = filename
+        self.path = os.path.join(JsonCacheFile.cache_dir_name, filename)
+        self.content = copy.copy(default)
+        self.default = copy.copy(default)
+
+        os.makedirs(JsonCacheFile.cache_dir_name, exist_ok=True)
+
+        if read_on_init:
+            self.read()
+
+    def read(self) -> Any:
+        try:
+            with open(self.path) as file:
+                self.content = json.load(file)
+        except (json.JSONDecodeError, FileNotFoundError):
+            self.wipe()
+            return self.default
+        else:
+            return self.content
+
+    # noinspection PyTypeChecker
+    def write(self):
+        try:
+            with open(self.path, "w") as file:
+                json.dump(self.content, file)
+        except PermissionError:
+            log(f"Permission denied when writing to {self.path}: {traceback.format_exc().rstrip()}")
+
+    def wipe(self):
+        self.content = copy.copy(self.default)
+        self.write()
+
+
+@dataclass
+class UpdaterTask:
+    plugin_id: str
+    channel_id: int
+    channel_username: str
+    message_id: int
+
+
+class AutoUpdater:
+    def __init__(self):
+        self.thread: Optional[threading.Thread] = None
+        self.forced_stop = False
+        self.tasks: List[UpdaterTask] = []
+        self.msg_edited_ts_cache = JsonCacheFile("altylib_au__msg_edited_ts", {})  # plugin_id: edit_timestamp_of_message_with_file
+
+    def run(self):
+        self.forced_stop = False
+
+        if self.thread is None:
+            self.thread = threading.Thread(target=self.cycle)
+            self.thread.daemon = True
+
+        if self.thread.is_alive():
+            self.log(f"AutoUpdater (id: {id(self)}) has not been stopped")
+            return
+
+        self.thread.start()
+        self.log(f"AutoUpdater (id: {id(self)}) has been started")
+
+    def force_stop(self):
+        if self.thread is None:
+            self.log("Ignoring force_stop(): AutoUpdater thread has not been started")
+            return
+        self.forced_stop = True
+
+    def cycle(self):
+        while not self.forced_stop:
+            try:
+                self.check_for_updates()
+
+                timer = 0
+                while timer < self.get_timeout_time():
+                    if self.forced_stop:
+                        break
+
+                    time.sleep(1)
+                    timer += 1
+            except Exception:
+                self.log(f"Exception in cycle (id: {id(self)}): {traceback.format_exc().rstrip()}")
+
+        self.thread = None
+        self.log(f"Force stopped (id: {id(self)})")
+
+    def check_for_updates(self):
+        def get_messages_callback(response, error):
+            if error is not None:
+                log(f"Auto update task of plugin (id: {task.plugin_id}) has invalid message. Removing task")
+                self.remove_task(task)
+                return
+
+            msg = get_message(response.messages, task.message_id)
+            if not is_valid_plugin_message(msg):
+                log(f"Auto update task of plugin (id: {task.plugin_id}) has invalid message (invalid/no document attached). Removing task")
+                self.remove_task(task)
+                return
+
+            disable_ts_check = setting_getter("disable_ts_check", DEFAULT_EDIT_TIMESTAMP_CHECK)
+            if not disable_ts_check:
+                msg_edited_ts = self.msg_edited_ts_cache.content.get(task.plugin_id)
+                if msg.edit_date == msg_edited_ts:
+                    self.log((
+                        "The message with plugin attachment has not been updated since the "
+                        f"last parse. Skipping plugin (id: {task.plugin_id}) update"
+                    ))
+                    return
+
+            log(f"Executing auto update of plugin (id: {task.plugin_id})")
+
+            file_loader = get_file_loader()
+            document = msg.media.getDocument()
+            path = file_loader.getPathToAttach(document, True)
+
+            if path.exists():
+                self.msg_edited_ts_cache.content[task.plugin_id] = msg.edit_date
+                self.msg_edited_ts_cache.write()
+
+            run_on_ui_thread(lambda: download_and_install_plugin(msg))
+
+        for task in list(self.tasks):  # iterate copy of self.tasks to prevent RuntimeError
+            get_messages(task.channel_id, task.channel_username, get_messages_callback)
+
+    def is_task_already_present(self, task: UpdaterTask):
+        for i in list(self.tasks):
+            if i.plugin_id == task.plugin_id:
+                return True
+        return False
+
+    def add_task(self, task: UpdaterTask):
+        if self.is_task_already_present(task):
+            self.log(f"Task (id: {task.plugin_id}) is already present")
+            return
+
+        self.tasks.append(task)
+        self.log(f"Added task (id: {task.plugin_id}) to autoupdater")
+
+    def remove_task(self, task: UpdaterTask):
+        if task in self.tasks:
+            self.tasks.remove(task)
+            self.log(f"Removed task (id: {task.plugin_id}) from autoupdater")
+        else:
+            self.log(f"Task (id: {task.plugin_id}) is not present in list")
+
+    def remove_task_by_id(self, plugin_id: str):
+        for task in self.tasks:
+            if plugin_id == task.plugin_id:
+                self.tasks.remove(task)
+                break
+        else:
+            self.log(f"Task (id: {plugin_id}) is not present in list")
+            return
+        self.log(f"Removed task (id: {plugin_id}) from autoupdater")
+
+    @staticmethod
+    def log(text):
+        log("[PyObject] [AutoUpdater] " + text)
+
+    def get_timeout_time(self) -> int:
+        try:
+            return int(setting_getter("autoupdate_timeout", DEFAULT_AUTOUPDATE_TIMEOUT))
+        except (ValueError, TypeError):
+            self.log(f"Exception in cycle (id: {id(self)}): {traceback.format_exc().rstrip()}")
+            return int(DEFAULT_AUTOUPDATE_TIMEOUT)
+
+
+def is_valid_plugin_message(msg):
+    if msg is None or msg.media is None:
+        return False
+
+    document = msg.media.getDocument()
+    if document.attributes.isEmpty() or not document.attributes.get(0).file_name.endswith(".plugin"):
+        return False
+    return True
+
+
+def download_and_install_plugin(msg):
+    def plugin_install_error(arg):
+        if arg is None:
+            return
+        BulletinHelper.show_error(arg)
+
+    file_loader = get_file_loader()
+    plugins_controller = PluginsController.getInstance()
+    document = msg.media.getDocument()
+    path = file_loader.getPathToAttach(document, True)
+
+    if path.exists():
+        log("Installing...")
+        plugins_controller.loadPluginFromFile(str(path), Callback1(plugin_install_error))
+    else:
+        log("Started loading the file...")
+        file_loader.loadFile(document, "plugin_update", FileLoader.PRIORITY_NORMAL, 1)
+
+
+def get_messages(channel_id: int, channel_username: str, callback: Callable):
+    def get_message_callback(response, error):
+        if error or not response:
+            callback(None, error)
+            return
+
+        messages = cast(TLRPC.messages_Messages, response)
+        callback(messages, None)
+
+    def send():
+        send_request(req, get_message_callback)
+
+    def channel_resolve_callback(arg):
+        if arg is not None and arg.id == channel_id:
+            req.peer = TLRPC.TL_inputPeerChannel()
+            req.peer.channel_id = arg.id
+            req.peer.access_hash = arg.access_hash
+            run_on_ui_thread(send)
+            return
+        log(f"Failed to resolve a channel (id: {channel_id}; username: {channel_username}). Make sure you have entered the correct data")
+
+    req = TLRPC.TL_messages_getHistory()
+    req.peer = get_messages_controller().getInputPeer(channel_id)
+    req.offset_id = 0
+    req.limit = 50
+
+    if req.peer.access_hash == 0:
+        ChatUtils.getInstance().resolveChannel(channel_username, Callback1(channel_resolve_callback))
+    else:
+        run_on_ui_thread(send)
+
+
+def get_message(messages, message_id: int) -> Optional[TLRPC.Message]:
+    for i in range(messages.size()):
+        if messages.get(i).id == message_id:
+            return messages.get(i)
+    return None
+
+
+# --- Internal log buffer for AltyLib -------------------------------------------------
+
+_LOG_BUFFER: list = []  # type: ignore[var-annotated]
+_MAX_LOG_BUFFER = 500  # keep last N lines
+
+
+def log(string: str):
+    """Write message to Android logcat and store it in an internal buffer."""
+    msg = f"{__name__}: {string}"
+    logcat(msg)
+    try:
+        _LOG_BUFFER.append(msg)
+        if len(_LOG_BUFFER) > _MAX_LOG_BUFFER:
+            _LOG_BUFFER.pop(0)
+    except Exception:
+        # buffer failures should not break execution
+        pass
+
+
+def get_logs(limit: int = 200) -> str:
+    """Return the last *limit* log lines joined with newlines."""
+    try:
+        slice_start = max(len(_LOG_BUFFER) - limit, 0)
+        return "\n".join(_LOG_BUFFER[slice_start:])
+    except Exception:
+        return ""  # fallback empty if any error
+
+
+def clear_logs():
+    """Erase all buffered log entries."""
+    try:
+        _LOG_BUFFER.clear()
+    except Exception:
+        pass
+
+
+# noinspection PyTypeChecker
+def add_autoupdater_task(plugin_id: str, channel_id: int, channel_username: str, message_id: int):
+    task = UpdaterTask(plugin_id, channel_id, channel_username, message_id)
+
+    if autoupdater is None:
+        logcat("AutoUpdater is not initialized yet, saving task to pending list")
+        pending_tasks_cache.content.append(asdict(task))
+        pending_tasks_cache.write()
+        return
+
+    autoupdater.add_task(task)
+
+
+# noinspection PyTypeChecker
+def remove_autoupdater_task(plugin_id: str):
+    if autoupdater is None:
+        logcat("AutoUpdater is not initialized yet")
+        return
+
+    autoupdater.remove_task_by_id(plugin_id)
+
+
+# noinspection PyTypeChecker
+def cache_all_autoupdater_tasks(wipe: bool):
+    if wipe:
+        pending_tasks_cache.wipe()
+
+    for task in autoupdater.tasks:
+        pending_tasks_cache.content.append(asdict(task))
+    pending_tasks_cache.write()
+
+
+def load_cached_autoupdater_tasks(wipe: bool):
+    for task in pending_tasks_cache.content:
+        try:
+            autoupdater.add_task(UpdaterTask(**task))
+        except TypeError:
+            pass
+
+    if wipe:
+        pending_tasks_cache.wipe()
+
+
+AUTOUPDATE_CHANNEL_ID = 2549262404
+AUTOUPDATE_CHANNEL_USERNAME = "AltyPlugins"
+AUTOUPDATE_MESSAGE_ID = 26
+
+DEFAULT_EDIT_TIMESTAMP_CHECK = False
+DEFAULT_DISABLE_AUTOUPDATER = False
+DEFAULT_AUTOUPDATE_TIMEOUT = str(10 * 60)
+
+setting_getter: Optional[Callable] = None
+autoupdater: Optional[AutoUpdater] = None
+pending_tasks_cache = JsonCacheFile("altylib_au__pending_tasks_list", [])
+
+HIDDEN_PLUGIN_IDS: set = set()
+
+
+class AltyLib(BasePlugin):
+    def create_settings(self):
+        try:
+            return [
+                Header(text="AutoUpdater"),
+                Input(
+                    key="autoupdate_timeout",
+                    text="Auto update timeout",
+                    subtext="Time in seconds between update checks",
+                    default=DEFAULT_AUTOUPDATE_TIMEOUT,
+                    icon="msg2_autodelete",
+                ),
+                Switch(
+                    key="disable_autoupdate",
+                    text="Disable autoupdates",
+                    subtext="Auto updater will be disabled",
+                    default=DEFAULT_DISABLE_AUTOUPDATER,
+                    icon="msg_photo_switch2",
+                    on_change=lambda enabled: autoupdater.force_stop() if enabled else run_on_ui_thread(autoupdater.run)
+                ),
+                Switch(
+                    key="disable_ts_check",
+                    text="Disable message edit check",
+                    subtext="Plugin will be updated even if the file has not been modified",
+                    default=DEFAULT_EDIT_TIMESTAMP_CHECK,
+                    icon="msg_recent",
+                ),
+            ]
+        except Exception:
+            text = (
+                f"An exception occurred on {self.__class__.__name__}.create_settings():\n"
+                f"{traceback.format_exc().rstrip()}"
+            )
+            log(text)
+            return [Divider(text=text)]
+
+    def on_plugin_load(self):
+        global autoupdater, setting_getter
+        setting_getter = self.get_setting
+
+        log("Initialising AutoUpdater...")
+        autoupdater = AutoUpdater()
+        add_autoupdater_task(__id__, AUTOUPDATE_CHANNEL_ID, AUTOUPDATE_CHANNEL_USERNAME, AUTOUPDATE_MESSAGE_ID)
+
+        if not self.get_setting("disable_autoupdate", DEFAULT_DISABLE_AUTOUPDATER):
+            log("Adding tasks from cache...")
+            load_cached_autoupdater_tasks(wipe=True)
+            autoupdater.run()
+
+        log("Loaded")
+
+        # New: hook plugin events and patch Command List plugin
+        try:
+            PCClass = find_class("com.exteragram.messenger.plugins.PluginsController")
+            StringClass = find_class("java.lang.String")
+            CallbackClass = find_class("org.telegram.messenger.Utilities$Callback")
+            # Hook installation (loadPluginFromFile)
+            # Some builds hide reflection APIs; try several fallbacks
+            load_method = None
+            try:
+                load_method = PCClass.getDeclaredMethod("loadPluginFromFile", StringClass, CallbackClass)
+            except Exception:
+                # Try iterate declared / public methods
+                for _fetch in ("getDeclaredMethods", "getMethods"):
+                    try:
+                        for m in getattr(PCClass, _fetch)():
+                            if m.getName() == "loadPluginFromFile" and len(m.getParameterTypes()) == 2:
+                                load_method = m
+                                break
+                        if load_method:
+                            break
+                    except Exception:
+                        pass
+            if load_method is not None:
+                self.hook_method(load_method, _PluginEventHook())
+            else:
+                log("Altylib: Could not hook loadPluginFromFile – reflection restricted")
+            # Hook enable/disable (setPluginEnabled) – find by name to avoid signature issues across versions
+            set_enabled_method = None
+            for m in PCClass.getDeclaredMethods():
+                if m.getName() == "setPluginEnabled":
+                    set_enabled_method = m
+                    break
+            if set_enabled_method is not None:
+                self.hook_method(set_enabled_method, _PluginEventHook())
+            log("Altylib: Hooked PluginsController methods for plugin events")
+        except Exception:
+            log(f"Altylib: Failed to hook PluginsController methods: {traceback.format_exc().rstrip()}")
+
+        # Hide ALTYLIB commands from Command List plugin
+        try:
+            _patch_comlist_plugin()
+        except Exception:
+            log(f"Altylib: ComList patch error: {traceback.format_exc().rstrip()}")
+
+        # Ensure TG alias hook is installed even if no aliases are registered yet
+        try:
+            _ensure_tg_hook(self)
+        except Exception:
+            log(f"Altylib: TG hook setup failed in on_plugin_load: {traceback.format_exc().rstrip()}")
+
+    def on_plugin_unload(self):
+        log("Caching all tasks to add them again after reloading the plugin")
+        cache_all_autoupdater_tasks(wipe=True)
+
+        log("Force-stopping the AutoUpdater")
+        autoupdater.force_stop()
+
+        log("Unloaded")
+
+
+def detect_client() -> str:
+    # First, try to inspect Android files dir via ApplicationLoader
+    try:
+        from org.telegram.messenger import ApplicationLoader  # type: ignore
+        base_dir = ApplicationLoader.getFilesDir().getAbsolutePath()
+    except Exception:
+        base_dir = None
+
+    # Fallback to plugin file location
+    if not base_dir:
+        try:
+            base_dir = os.path.realpath(__file__)
+        except Exception:
+            base_dir = ""
+
+    # Normalise to lower for substring checks
+    low = str(base_dir).lower()
+    if "com.exteragram.messenger" in low:
+        return "exteragram"
+    if "org.telegram.messenger.web" in low or "com.radolyn.ayugram" in low:
+        return "ayugram"
+    # default
+    return "ayugram"
+
+
+# === Hook helpers (borrowed & simplified from checkpresence.plugin) ===
+
+class _PluginEventHook(MethodHook):
+    """Logs plugin installation/enabling/disabling events."""
+    def after_hooked_method(self, param):
+        try:
+            method_name = param.method.getName() if param and param.method else "<unknown>"
+            if method_name == "loadPluginFromFile":
+                pth = param.args[0] if param and param.args and len(param.args) >= 1 else None
+                if isinstance(pth, str):
+                    log(f"Plugin loaded from '{pth}' (client: {detect_client()})")
+            elif method_name == "setPluginEnabled":
+                plugin_id = param.args[0] if param and param.args and len(param.args) >= 1 else None
+                enabled = param.args[1] if param and param.args and len(param.args) >= 2 else None
+                log(f"Plugin enable state changed: id={plugin_id} enabled={enabled}")
+        except Exception:
+            log(f"_PluginEventHook error: {traceback.format_exc().rstrip()}")
+
+
+# === Hide Altylib commands from the Command List plugin ===
+
+def _apply_patch_to_chp(CHP):
+    try:
+        if not (isinstance(CHP, type)):
+            return False
+        # Patch legacy _get_all_commands
+        if hasattr(CHP, "_get_all_commands"):
+            orig_get = CHP._get_all_commands
+            if not getattr(orig_get, "_Altylib_hidden", False):
+                def _wrapped_get(self, *args, **kwargs):  # type: ignore
+                    data = orig_get(self, *args, **kwargs)
+                    try:
+                        for _k in list(data.keys()):
+                            key_low = str(_k).lower()
+                            if any(pid in key_low for pid in HIDDEN_PLUGIN_IDS):
+                                data.pop(_k, None)
+                    except Exception:
+                        pass
+                    return data
+                _wrapped_get._Altylib_hidden = True  # type: ignore
+                CHP._get_all_commands = _wrapped_get  # type: ignore
+        # Patch secure harvester
+        if hasattr(CHP, "_secure_command_harvester"):
+            secure_orig = CHP._secure_command_harvester  # type: ignore
+            if not getattr(secure_orig, "_Altylib_hidden", False):
+                def _wrapped_sec(self, *args, **kwargs):  # type: ignore
+                    data = secure_orig(self, *args, **kwargs)
+                    try:
+                        for _k in list(data.keys()):
+                            key_low = str(_k).lower()
+                            if any(pid in key_low for pid in HIDDEN_PLUGIN_IDS):
+                                data.pop(_k, None)
+                    except Exception:
+                        pass
+                    return data
+                _wrapped_sec._Altylib_hidden = True  # type: ignore
+                CHP._secure_command_harvester = _wrapped_sec  # type: ignore
+
+        # Update already-created instances so they use wrapped methods as well
+        try:
+            import plugins_manager as _pm
+            for _inst in list(getattr(_pm.PluginsManager, '_plugins', {}).values()):
+                if isinstance(_inst, CHP):
+                    for attr_name, attr_val in list(_inst.__dict__.items()):
+                        if callable(attr_val):
+                            func_obj = getattr(attr_val, "__func__", attr_val)
+                            if func_obj in (secure_orig, _wrapped_sec):
+                                _inst.__dict__[attr_name] = _wrapped_sec.__get__(_inst, CHP)
+                            if 'orig_get' in locals() and func_obj in (orig_get, _wrapped_get):
+                                _inst.__dict__[attr_name] = _wrapped_get.__get__(_inst, CHP)
+        except Exception:
+            pass
+
+        return True
+    except Exception:
+        return False
+
+
+def _patch_comlist_plugin():
+    try:
+        import sys
+        from base_plugin import BasePlugin
+        patched = False
+        for _mod in list(sys.modules.values()):
+            try:
+                if getattr(_mod, "__id__", None) != "command_list_by_mihailkotovski":
+                    continue
+                CHP = getattr(_mod, "CommandHarvesterPlugin", None)
+                if CHP and _apply_patch_to_chp(CHP):
+                    patched = True
+                    _patch_comlist_filter(CHP)
+                    break
+            except Exception:
+                continue
+        if not patched:
+            for cls in list(BasePlugin.__subclasses__()):
+                if cls.__name__ != "CommandHarvesterPlugin":
+                    continue
+                if _apply_patch_to_chp(cls):
+                    patched = True
+                    _patch_comlist_filter(cls)
+                    break
+    except Exception:
+        log(f"Altylib: Failed to patch Command List plugin: {traceback.format_exc().rstrip()}")
+
+
+def hide_my_commands(plugin_id: Optional[str] = None):
+    """Register the given plugin id to have its commands hidden from @comlist.
+    If plugin_id is None, attempts to detect the caller's __id__ attribute automatically.
+    Usage (in another plugin):
+        from Altylib import hide_my_commands
+        hide_my_commands()  # will hide commands of that plugin
+    """
+    import inspect
+    global HIDDEN_PLUGIN_IDS
+    if plugin_id is None:
+        frame = inspect.currentframe()
+        if frame is not None and frame.f_back is not None:
+            caller_globals = frame.f_back.f_globals
+            plugin_id = caller_globals.get("__id__") or caller_globals.get("__name__")
+    if plugin_id:
+        pid_low = plugin_id.lower()
+        is_new = pid_low not in HIDDEN_PLUGIN_IDS
+        HIDDEN_PLUGIN_IDS.add(pid_low)
+        # Try to also hide by plugin's display name
+        try:
+            import plugins_manager as _pm
+            pl_obj = _pm.PluginsManager._plugins.get(plugin_id)
+            if pl_obj and getattr(pl_obj, 'name', None):
+                HIDDEN_PLUGIN_IDS.add(str(pl_obj.name).lower())
+        except Exception:
+            pass
+        if is_new:
+            log(f"Registered plugin '{plugin_id}' for command hiding (total hidden: {len(HIDDEN_PLUGIN_IDS)})")
+        try:
+            _patch_comlist_plugin()  # ensure patch applied
+        except Exception:
+            pass
+
+
+def detect_language() -> str:
+    """Detect current UI language code of the client (e.g. 'en', 'ru').
+    Primary method uses Telegram's LocaleController; fallback to Python's locale.
+    """
+    try:
+        from org.telegram.messenger import LocaleController  # type: ignore
+        lang = LocaleController.getInstance().getCurrentLocale().getLanguage()
+        if lang:
+            return str(lang)
+    except Exception:
+        pass
+    # Fallback to Python locale
+    try:
+        import locale as _locale
+        loc = _locale.getdefaultlocale()
+        if loc and loc[0]:
+            return str(loc[0]).split("_")[0]
+    except Exception:
+        pass
+    return "en"
+
+
+#Cross-plugin Shared Key-Value Store 
+
+_shared_store_lock = threading.Lock()
+_shared_store_path = os.path.join(JsonCacheFile.cache_dir_name, "altylib_shared_store.json")
+
+# In-memory cache of shared data
+try:
+    with open(_shared_store_path, "r", encoding="utf-8") as _ssf:
+        _shared_store_cache: dict = json.load(_ssf)
+except Exception:
+    _shared_store_cache: dict = {}
+
+
+def _shared_store_flush():
+    """Write cache to disk atomically."""
+    try:
+        tmp_path = _shared_store_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as _tf:
+            json.dump(_shared_store_cache, _tf)
+        os.replace(tmp_path, _shared_store_path)
+    except Exception:
+        log(f"SharedStore flush error: {traceback.format_exc().rstrip()}")
+
+
+def shared_set(key: str, value: Any):
+    """Set value for key in the cross-plugin store."""
+    with _shared_store_lock:
+        _shared_store_cache[key] = value
+        _shared_store_flush()
+
+
+def shared_get(key: str, default: Any = None) -> Any:
+    """Retrieve value for key from the shared store (default if missing)."""
+    with _shared_store_lock:
+        return copy.deepcopy(_shared_store_cache.get(key, default))
+
+
+def shared_delete(key: str):
+    """Remove a key from the store, if present."""
+    with _shared_store_lock:
+        if key in _shared_store_cache:
+            _shared_store_cache.pop(key, None)
+            _shared_store_flush()
+
+
+def shared_all() -> dict:
+    """Return a deep copy of the entire shared store."""
+    with _shared_store_lock:
+        return copy.deepcopy(_shared_store_cache)
+
+
+# UI Helpers
+
+_spinner_dialog_builder: Optional[AlertDialogBuilder] = None
+
+
+def get_current_activity():
+    """Try to retrieve the current Android activity via last fragment."""
+    try:
+        frag = get_last_fragment()
+        if frag:
+            act = frag.getParentActivity()
+            if act:
+                return act
+    except Exception:
+        pass
+    return None
+
+
+def _run_ui(fn):
+    """Helper: execute fn on UI thread (sync if already on UI thread)."""
+    run_on_ui_thread(fn)
+
+
+# Bulletin wrappers
+
+def bulletin_info(text: str):
+    """Show informational bulletin/toast message."""
+    log(f"Bulletin_info called: {text}")
+    _run_ui(lambda: BulletinHelper.show(text))
+
+
+def bulletin_error(text: str):
+    log(f"Bulletin_error called: {text}")
+    _run_ui(lambda: BulletinHelper.show_error(text))
+
+
+def bulletin_success(text: str):
+    # Some builds have BulletinHelper.show_success; fall back to show
+    def _impl():
+        if hasattr(BulletinHelper, "show_success"):
+            log(f"Bulletin_success called: {text}")
+            BulletinHelper.show_success(text)  # type: ignore
+        else:
+            log(f"Bulletin_success called (fallback): {text}")
+            BulletinHelper.show(text)
+    _run_ui(_impl)
+
+
+# Spinner dialog
+
+def show_spinner(text: Optional[str] = None):
+    """Show modal spinner. Returns builder handle to dismiss later."""
+    global _spinner_dialog_builder
+    def _impl():
+        global _spinner_dialog_builder
+        if _spinner_dialog_builder is not None:
+            # already shown
+            return
+        act = get_current_activity()
+        if not act:
+            return
+        builder = AlertDialogBuilder(act, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        builder.set_cancelable(False)
+        if text and hasattr(builder, "set_text"):
+            try:
+                builder.set_text(text)
+            except Exception:
+                pass
+        builder.show()
+        _spinner_dialog_builder = builder
+    _run_ui(_impl)
+    return _spinner_dialog_builder
+
+
+def hide_spinner():
+    global _spinner_dialog_builder
+    def _impl():
+        global _spinner_dialog_builder
+        if _spinner_dialog_builder:
+            try:
+                _spinner_dialog_builder.dismiss()
+            except Exception:
+                pass
+            _spinner_dialog_builder = None
+    _run_ui(_impl)
+
+
+# === Utility: return list of plugin directories ===
+
+def get_plugins_dirs() -> list:
+    """Return a list of directories where plugins may reside for the current client."""
+    dirs = []
+    # Try to get runtime plugins dir from PluginsManager
+    try:
+        import plugins_manager as _pm  # type: ignore
+        pm = _pm.PluginsManager
+        plugin_dir = getattr(pm, '_plugins_dir', None)
+        if plugin_dir and plugin_dir not in dirs:
+            dirs.append(plugin_dir)
+    except Exception:
+        pass
+
+    # Known base dirs
+    known = [
+        "/data/user/0/com.exteragram.messenger/files",
+        "/data/user/0/org.telegram.messenger.web/files",
+        "/data/user/0/com.radolyn.ayugram/files",
+    ]
+    for d in known:
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+# Robust retrieval of current module without relying on double-underscore names
+import sys as _sys
+_module_name = globals().get('__name__') or globals().get('name')
+this_module = _sys.modules.get(_module_name)
+if this_module is None:
+    # Fallback: last inserted module in sys.modules (should be ourselves during import)
+    this_module = _sys.modules[list(_sys.modules.keys())[-1]]
+
+for _alias in ("zwylib", "zwyLib", "ZwyLib", "Zwylib", "AltyLib", "Altylib", "altylib"):
+    _sys.modules.setdefault(_alias, this_module)
+
+#Additional filter on _format_command_list 
+
+def _patch_comlist_filter(CHP):
+    try:
+        if hasattr(CHP, "_format_command_list"):
+            orig_fmt = CHP._format_command_list
+            if getattr(orig_fmt, "_alty_filtered", False):
+                return
+
+            def _wrapped_fmt(self, all_commands, __o=orig_fmt):
+                try:
+                    filtered = {}
+                    for k, v in all_commands.items():
+                        low = str(k).lower()
+                        if low in HIDDEN_PLUGIN_IDS:
+                            continue
+                        skip = False
+                        for pid in HIDDEN_PLUGIN_IDS:
+                            if pid in low:
+                                skip = True
+                                break
+                        if not skip:
+                            filtered[k] = v
+                except Exception:
+                    filtered = all_commands
+                return __o(self, filtered)
+
+            _wrapped_fmt._alty_filtered = True  # type: ignore
+            CHP._format_command_list = _wrapped_fmt  # type: ignore
+
+            # Update instances
+            try:
+                import plugins_manager as _pm
+                for inst in list(getattr(_pm.PluginsManager, '_plugins', {}).values()):
+                    if isinstance(inst, CHP):
+                        if hasattr(inst, "_format_command_list"):
+                            inst._format_command_list = _wrapped_fmt.__get__(inst, CHP)  # type: ignore
+            except Exception:
+                pass
+    except Exception:
+        log(f"Altylib: Failed to patch format_command_list: {traceback.format_exc().rstrip()}")
+
+#TG Alias support
+
+_TG_ALIAS_MAP: dict = {}
+_tg_hook_installed = False
+
+
+class _TGIntentHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            if not _TG_ALIAS_MAP:
+                return
+            if not param.args or len(param.args) < 1:
+                return
+            intent = param.args[0]
+            if intent is None:
+                return
+            data = intent.getData()
+            if data is None:
+                return
+            url = str(data.toString())
+            if not url.startswith("tg://"):
+                return
+            # Remove 'tg://' prefix and leading '/'
+            path = url[5:]
+            if path.startswith("/"):
+                path = path[1:]
+            # Iterate registered aliases
+            for alias, cb in list(_TG_ALIAS_MAP.items()):
+                if path.startswith(alias):
+                    try:
+                        run_on_ui_thread(lambda: cb(intent))
+                    except Exception as e:
+                        log(f"TG alias callback error for '{alias}': {e}")
+                    # prevent default processing if possible
+                    try:
+                        param.setResult(None)
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            log(f"_TGIntentHook error: {traceback.format_exc().rstrip()}")
+
+
+def _ensure_tg_hook(plugin_self):
+    global _tg_hook_installed
+    if _tg_hook_installed:
+        return
+    try:
+        LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+        IntentClass = find_class("android.content.Intent")
+        LAClass = LaunchActivity.getClass() if hasattr(LaunchActivity, "getClass") else LaunchActivity
+
+        # Try to enumerate methods first (preferred for exhaustive hooking)
+        _methods = []
+        for _fetch in ("getDeclaredMethods", "getMethods"):
+            try:
+                _methods = list(getattr(LAClass, _fetch)())
+                break
+            except Exception:
+                _methods = []
+
+        if _methods:
+            for m in _methods:
+                if m.getName() != "handleIntent":
+                    continue
+                params = m.getParameterTypes()
+                if params is None or len(params) == 0:
+                    continue
+                first = params[0]
+                try:
+                    if first != IntentClass and first.getName() != "android.content.Intent":
+                        continue
+                except Exception:
+                    if str(first) != str(IntentClass):
+                        continue
+                plugin_self.hook_method(m, _TGIntentHook())
+            _tg_hook_installed = True
+            log("Altylib: TG alias hook installed (enumeration)")
+            return
+
+        # Enumeration failed – fallback to known signature used in re_extera.plugin
+        try:
+            from java.lang import Boolean  # type: ignore
+            BrowserProgress = find_class("org.telegram.messenger.browser.Browser$Progress")
+            method_sig = [IntentClass, Boolean.TYPE, Boolean.TYPE, Boolean.TYPE, BrowserProgress, Boolean.TYPE, Boolean.TYPE]
+            try:
+                m = LAClass.getDeclaredMethod("handleIntent", *method_sig)
+                plugin_self.hook_method(m, _TGIntentHook())
+                _tg_hook_installed = True
+                log("Altylib: TG alias hook installed (re_extera signature)")
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        log("Altylib: Could not install TG alias hook – reflection restricted")
+        _tg_hook_installed = True  # prevent further attempts
+    except Exception:
+        log(f"Altylib: Failed to install TG alias hook: {traceback.format_exc().rstrip()}")
+
+
+def add_tg_alias(path: str, callback):
+    """Register a custom tg://<path> alias. Example path: 're/augh' (without leading slash).
+    Callback receives the original Intent object and runs on UI thread.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be non-empty string")
+    _TG_ALIAS_MAP[path] = callback
+    try:
+        # ensure hook via first loaded AltyLib instance
+        import plugins_manager as _pm
+        for _pl in _pm.PluginsManager._plugins.values():
+            if getattr(_pl, 'id', None) == __id__:
+                _ensure_tg_hook(_pl)
+                break
+    except Exception:
+        pass
+
+
+def remove_tg_alias(path: str):
+    _TG_ALIAS_MAP.pop(path, None)
+
+
+# === Simple Event Bus ==============================================================
+
+_EVENT_LOCK = threading.Lock()
+_EVENT_LISTENERS: dict = {}
+
+
+def events_subscribe(event: str, callback):
+    """Subscribe to an event name. Callback receives one argument: data."""
+    if not callable(callback):
+        raise ValueError("callback must be callable")
+    with _EVENT_LOCK:
+        _EVENT_LISTENERS.setdefault(event, []).append(callback)
+
+
+def events_unsubscribe(event: str, callback):
+    with _EVENT_LOCK:
+        lst = _EVENT_LISTENERS.get(event)
+        if lst and callback in lst:
+            lst.remove(callback)
+
+
+def events_publish(event: str, data=None, *, async_call: bool = True):
+    """Publish an event to all listeners. If *async_call* is True, callbacks run on background queue."""
+    with _EVENT_LOCK:
+        listeners = list(_EVENT_LISTENERS.get(event, []))
+    log(f"EventBus: publish '{event}' to {len(listeners)} listener(s)")
+    if not listeners:
+        return
+    for cb in listeners:
+        try:
+            if async_call:
+                run_on_queue(lambda cb=cb: cb(data))
+            else:
+                cb(data)
+        except Exception as e:
+            log(f"Event '{event}' handler error: {e}")
+
+
+# Simplified Command Manager 
+
+_CMD_LOCK = threading.Lock()
+_COMMANDS: dict = {}
+
+
+def register_command(name: str, callback, description: str = ""):
+    """Register a global text command ('.<name>'). Callback signature: (plugin_self, args_str, params)."""
+    if not callable(callback):
+        raise ValueError("callback must be callable")
+    with _CMD_LOCK:
+        _COMMANDS[name.lower()] = {
+            "callback": callback,
+            "description": description or callback.__doc__ or "",
+        }
+
+
+def get_registered_commands():
+    with _CMD_LOCK:
+        return {k: v["description"] for k, v in _COMMANDS.items()}
+
+
+def _call_command(cmd_lower: str, plugin_self, args: str, params):
+    entry = _COMMANDS.get(cmd_lower)
+    if not entry:
+        return None
+    cb = entry["callback"]
+    try:
+        return cb(plugin_self, args, params)
+    except Exception as e:
+        log(f"Command '{cmd_lower}' error: {e}")
+        return f"Error executing command '{cmd_lower}': {e}"
+
+
+def handle_outgoing_command(plugin_self, account: int, params):
+    """Helper for use inside on_send_message_hook.
+
+    If params.message starts with a registered command, executes it and returns HookResult.
+    Otherwise returns None and caller should continue processing.
+    """
+    from base_plugin import HookResult, HookStrategy
+    msg = getattr(params, "message", None)
+    if not isinstance(msg, str) or not msg.startswith('.'):
+        return None
+    # split into command and rest
+    parts = msg[1:].split(' ', 1)
+    cmd = parts[0].lower()
+    args = parts[1] if len(parts) > 1 else ""
+
+    result = _call_command(cmd, plugin_self, args, params)
+    if result is None:
+        # unknown command
+        return None
+
+    if isinstance(result, HookResult):
+        return result
+    if isinstance(result, str):
+        params.message = result
+    # default: treat as MODIFY
+    return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+
+# Simple Task Scheduler
+
+_TASK_LOCK = threading.Lock()
+_TASKS: dict = {}  # name -> dict(cb, interval, next_ts)
+_SCHED_THREAD = None  # type: ignore[var-annotated]
+
+
+def _scheduler_loop():
+    global _SCHED_THREAD
+    while True:
+        with _TASK_LOCK:
+            tasks_snapshot = list(_TASKS.items())
+        if not tasks_snapshot:
+            break  # no tasks → exit thread
+        now = time.time()
+        for name, info in tasks_snapshot:
+            if now >= info["next_ts"]:
+                # schedule execution
+                run_on_queue(info["cb"])
+                with _TASK_LOCK:
+                    # task might have been cancelled while executing
+                    if name in _TASKS:
+                        _TASKS[name]["next_ts"] = now + info["interval"]
+        time.sleep(1)
+    _SCHED_THREAD = None
+
+
+def _ensure_scheduler_running():
+    global _SCHED_THREAD
+    if _SCHED_THREAD is None or not _SCHED_THREAD.is_alive():
+        _SCHED_THREAD = threading.Thread(target=_scheduler_loop, daemon=True)
+        _SCHED_THREAD.start()
+
+
+def tasks_schedule(name: str, callback, interval_seconds: int, *, run_immediately: bool = False):
+    """Schedule a periodic task. Name must be unique across plugins."""
+    if not callable(callback):
+        raise ValueError("callback must be callable")
+    with _TASK_LOCK:
+        _TASKS[name] = {
+            "cb": callback,
+            "interval": max(1, int(interval_seconds)),
+            "next_ts": time.time() if run_immediately else time.time() + interval_seconds,
+        }
+    log(f"TaskScheduler: scheduled '{name}' every {interval_seconds}s")
+    _ensure_scheduler_running()
+
+
+def tasks_cancel(name: str):
+    with _TASK_LOCK:
+        if _TASKS.pop(name, None) is not None:
+            log(f"TaskScheduler: cancelled '{name}'")
+
+
+def tasks_list():
+    with _TASK_LOCK:
+        return {k: v["interval"] for k, v in _TASKS.items()}
+
+
+# In-process RPC Registry
+
+_RPC_LOCK = threading.Lock()
+_RPC_FUNCS: dict = {}
+
+
+def rpc_register(name: str, func):
+    """Expose a callable under *name* for other plugins."""
+    if not callable(func):
+        raise ValueError("func must be callable")
+    with _RPC_LOCK:
+        _RPC_FUNCS[name] = func
+    log(f"RPC: registered '{name}'")
+
+
+def rpc_call(name: str, *args, **kwargs):
+    with _RPC_LOCK:
+        fn = _RPC_FUNCS.get(name)
+    if not fn:
+        raise RuntimeError(f"RPC: function '{name}' not found")
+    return fn(*args, **kwargs)
