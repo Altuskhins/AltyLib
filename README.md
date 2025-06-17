@@ -135,8 +135,6 @@ res = alty.rpc_call("math.add", 5, 7)   # 12
 | `show_spinner(text?) → builder` | Модальное крутилко-окно |
 | `hide_spinner()` | Скрыть |
 
-> На некоторых кастомных клиентах `BulletinHelper.show` скрыт; используйте `bulletin_success/error` для гарантии отображения.
-
 ---
 
 ## 5. Работа с данными
