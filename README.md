@@ -1,187 +1,240 @@
 # AltyLib
-Плагин для экстераграма, облегчающий разработку ваших плагинов
 
+Расширенная библиотека для плагинов exteraGram. Содержит DSL для настроек, типизированные заглушки для Telegram-контроллеров, менеджер безопасных хуков, форматирование сообщений, кэширование, готовые UI-компоненты и CLI-инструменты.
 
-# AltyLib — техническая документация  
-*(актуально для версии `1.0.3+`, июнь 2025)*  
+Документация актуальна для версии `1.1.0+` (июнь 2025).
 
 ---
 
 ## Содержание
-1. Быстрый старт  
-2. Структура библиотеки  
-3. Системы высокого уровня  
-   3.1. Event Bus  
-   3.2. Управление командами  
-   3.3. Планировщик задач  
-   3.4. RPC-реестр  
-4. UI-утилиты  
-5. Работа с данными  
-6. Хуки и вспомогательные функции  
-7. Общие советы по разработке  
+1. [Быстрый старт](#быстрый-старт)
+2. [CLI и генератор каркаса](#cli-и-генератор-каркаса)
+3. [Хранилище и кеши](#хранилище-и-кеши)
+4. [DSL настроек](#dsl-настроек)
+5. [Помощники Telegram API](#помощники-telegram-api)
+6. [Хуки и жизненный цикл](#хуки-и-жизненный-цикл)
+7. [Rate-limit и debounce](#rate-limit-и-debounce)
+8. [Форматирование сообщений](#форматирование-сообщений)
+9. [Медиа-хелперы](#медиа-хелперы)
+10. [UI-компоненты](#ui-компоненты)
+11. [Наблюдатели NotificationCenter](#наблюдатели-notificationcenter)
+12. [Диагностика и хот-ридлоад](#диагностика-и-хот-ридлоад)
+13. [Совместимость и feature flags](#совместимость-и-feature-flags)
+14. [Cookbook: готовые рецепты](#cookbook-готовые-рецепты)
+15. [FAQ и обратная связь](#faq-и-обратная-связь)
 
 ---
 
-## 1. Быстрый старт
+## Быстрый старт
 
 ```python
-# пример minimal_plugin.plugin
 __id__ = "hello"
 __name__ = "HelloPlugin"
 __min_version__ = "11.9.1"
 
 from base_plugin import BasePlugin, HookResult
-import altylib as alty      # импорт библиотеки
+import altylib as alty
+
+settings = alty.create_settings_registry(__name__)
+
+@settings.switch(default=True, summary="Отвечать на команду .hello")
+def enabled(value: bool):
+    alty.log(f"Hello command toggled to {value}")
 
 class Hello(BasePlugin):
     def on_plugin_load(self):
+        self.settings = settings
         alty.register_command("hello", self.cmd_hello, "Поздороваться")
-        alty.events_subscribe("hello:ping", lambda d: alty.bulletin_success(f"Pong from {__id__}!"))
 
-    # -- команды ----------------------------------------------------
     def cmd_hello(self, _self_pl, args, params):
-        alty.events_publish("hello:ping", None)
+        if not self.settings.get("enabled"):
+            return "Команда выключена"
         return "Hello from AltyLib!"
 
-    # -- перехват исходящих сообщений -------------------------------
     def on_send_message_hook(self, account, params):
-        res = alty.handle_outgoing_command(self, account, params)
-        return res or HookResult()
+        result = alty.handle_outgoing_command(self, account, params)
+        return result or HookResult()
 ```
 
----
-
-## 2. Структура библиотеки
-
-| Категория | API | Назначение |
-|-----------|-----|------------|
-| Логи | `log()/get_logs()/clear_logs()` | Унифицированный вывод и буфер последних 500 строк |
-| UI | `bulletin_info/error/success`, `show_spinner/hide_spinner` | Всплывающие уведомления и «спиннер» |
-| События | `events_subscribe/unsubscribe/publish` | Лёгкая шина между плагинами |
-| Команды | `register_command/handle_outgoing_command/get_registered_commands` | Централизованный парсинг `.<command>` |
-| Планировщик | `tasks_schedule/cancel/list` | Периодические фоновые задачи |
-| RPC | `rpc_register/call` | Вызов процедур между плагинами |
-| Данные | `JsonCacheFile`, `shared_*` | Кеш и key-value хранилище |
-| Прочее | `detect_client/language`, `get_plugins_dirs`, `get_current_activity`, TG-alias |
+* `create_settings_registry()` создаёт DSL-реестр настроек и связанное хранилище.
+* Все публичные API доступны через `altylib` после импорта (`import altylib as alty`).
 
 ---
 
-## 3. Системы высокого уровня
+## CLI и генератор каркаса
 
-### 3.1. Event Bus
+AltyLib поставляется с CLI-командой `altylib`:
 
-| Функция | Описание |
-|---------|----------|
-| `events_subscribe(event, callback)` | Подписка. Callback(data) |
-| `events_unsubscribe(event, callback)` | Отписка |
-| `events_publish(event, data, *, async_call=True)` | Рассылка события |
+```bash
+python -m altylib_cli init my_plugin --id hello --author @user
+python -m altylib_cli validate my_plugin/hello.plugin
+```
 
-> Внутри асинхронный вызов идёт через `run_on_queue`, поэтому обработчики не блокируют UI.
+* `init` — создаёт минимальный плагин (шаблон с метаданными и точкой входа).
+* `validate` — проверяет `.plugin`-файл на наличие обязательных полей.
 
-### 3.2. Управление командами
+---
 
-1. Регистрация:  
-   ```python
-   def cmd_echo(selfpl, args, params):      # сигнатура фиксирована
-       return args or "Nothing to echo"
-   alty.register_command("echo", cmd_echo, "Повторить текст")
-   ```
-2. Обработка: в своём `on_send_message_hook` первым делом вызоваем  
-   ```python
-   res = alty.handle_outgoing_command(self, account, params)
-   if res: return res
-   ```
+## Хранилище и кеши
 
-*Если callback возвращает строку — она заменит исходящее сообщение;  
-можно вернуть готовый `HookResult` для полного контроля.*
-
-### 3.3. Планировщик задач
+### KVStore
 
 ```python
-def my_job():
-    alty.log("Tick!")
-
-# каждые 300 с, без немедленного старта
-alty.tasks_schedule("my_job", my_job, 300)
-
-# отмена
-alty.tasks_cancel("my_job")
+store = alty.KVStore("my_plugin")
+store.set("counter", 1)
+value = store.get("counter", 0)
 ```
 
-– Внутренний поток-планировщик пробуждается каждую секунду  
-– Задачи выполняются в `externalNetworkQueue` через `run_on_queue`.
+* Значения сохраняются в JSON рядом с плагином, поддерживают примитивы и dict/list.
+* Доступны готовые экземпляры: `alty.store_global` (общий namespace) и отдельные для DSL настроек.
 
-### 3.4. RPC-реестр
+### TTLCache
 
 ```python
-# — в плагине-провайдере —
-alty.rpc_register("math.add", lambda a, b: a + b)
-
-# — в другом плагине —
-res = alty.rpc_call("math.add", 5, 7)   # 12
+cache = alty.TTLCache(ttl=30)
+cache.set("dialog", data)
+if cache.has("dialog"):
+    use(cache.get("dialog"))
 ```
 
-Если функция не найдена - возбуждается `RuntimeError`.
+* Обновляет `updated_at` при каждом чтении, автоматически очищает просроченные ключи.
+* Удобно для хранения результатов сетевых запросов и поиска сообщений.
 
 ---
 
-## 4. UI-утилиты
+## DSL настроек
 
-| Функция | Поведение |
-|---------|-----------|
-| `bulletin_info(text)` | Серый фон (не везде отображается) |
-| `bulletin_success(text)` | Зелёный/синий фон |
-| `bulletin_error(text)` | Красный фон |
-| `show_spinner(text?) → builder` | Модальное крутилко-окно |
-| `hide_spinner()` | Скрыть |
-
----
-
-## 5. Работа с данными
-
-### 5.1. JsonCacheFile
+`SettingsRegistry` описывает экран настроек через декораторы:
 
 ```python
-cache = alty.JsonCacheFile("history.json", default=[])
-cache.content.append({"ts": time.time()})
-cache.write()
+settings = alty.create_settings_registry("hello", title="Настройки Hello")
+
+@settings.switch(default=True, summary="Включить ответы")
+def enabled(value: bool):
+    alty.log(f"Enabled: {value}")
+
+@settings.list(options=[("Быстро", "fast"), ("Медленно", "slow")], default="fast")
+def mode(choice):
+    alty.log(f"Mode set to {choice}")
+
+@settings.slider(min_value=0, max_value=10, step=1, default=3)
+def retries(value: float):
+    alty.log(f"Retries: {value}")
+
+# Показать экран настроек в UI
+settings.open()
 ```
 
-Автоматически создаёт папку `plugins/<your plugin>/cache/`.
+* Каждый декоратор возвращает `SettingHandle` с методами `.get()`, `.set()` и `.toggle()`.
+* Значения автоматически сохраняются в `KVStore` и доступны через `settings.get()`.
+* `settings.open()` строит AlertDialog/Preference UI с текущими значениями и колбэками `on_change`.
 
-### 5.2. Shared-store между плагинами
+---
+
+## Помощники Telegram API
+
+* `resolve_peer("@username" | 123456789 | "-100…") -> TL_inputPeer` — универсальный резолвер ID/username.
+* `current_dialog()` — активный диалог (если доступен), `pick_dialog()` — UI-диалог выбора получателя.
+* `send_text(peer, text, reply_to=None, entities=None, silent=False)` — безопасная отправка сообщений.
+* Тайп-хелперы для `MessagesController`, `SendMessagesHelper`, `NotificationCenter` и др. доступны через прямые функции (`get_messages_controller`, `send_request`, `load_dialogs`, и т.п.).
+
+---
+
+## Хуки и жизненный цикл
+
+* `safe_hook(target, method, hook, *, plugin=None, group=None, once=False)` — обёртка над Xposed-хуками.
+  * Автоматически получает сигнатуры, предотвращает двойную регистрацию и логирует ошибки.
+* `HookGroup` и `HookLifecycle` позволяют группировать хуки и автоматически удалять их в `on_plugin_unload`.
+* `safe_unhook_all()` — аварийное снятие всех зарегистрированных хуков.
+
+---
+
+## Rate-limit и debounce
+
+* `debounce(wait, leading=False)` — декоратор для отложенного выполнения.
+* `throttle(interval)` — гарантирует вызов не чаще указанного интервала.
+* `RateLimiter(rate, per_seconds)` — очереди anti-flood; метод `.acquire()` блокирует до разрешённой скорости.
+
+Можно комбинировать с `send_text` и TL-запросами, чтобы избежать ограничений Telegram.
+
+---
+
+## Форматирование сообщений
+
+* `md("**bold** [link](https://example.com)") -> (text, entities)` — надстройка над Markdown Parser.
+* `split_text(long_text, limit=4096)` — разбивает текст на части, учитывая границы строк и слова.
+* Все offsets нормализованы под UTF-16, что удобно при работе с `TLRPC.MessageEntity*`.
+
+---
+
+## Медиа-хелперы
+
+* `download_media(message, blocking=False, priority=FileLoader.PRIORITY_NORMAL)` — возвращает путь к файлу после загрузки.
+* `save_to_gallery(path)` — переносит файл в медиа-библиотеку пользователя.
+* `with_image(path, fn)` — открывает изображение через Pillow, передаёт объект `Image` в колбэк и сохраняет результат.
+
+---
+
+## UI-компоненты
+
+* `snackbar_info/warn/error/undo` — единый стиль Snackbar/Bulletin для уведомлений.
+* `quick_list_pick(title, options, on_select)` — быстрые списки.
+* `show_bottom_sheet(items, on_select)` — модальные нижние листы.
+* `copy_to_clipboard(label, text)` — копирование в буфер с уведомлением.
+
+Компоненты используют готовые контроллеры exteraGram и выдерживают единый визуальный стиль.
+
+---
+
+## Наблюдатели NotificationCenter
 
 ```python
-alty.shared_set("counter", 42)
-val = alty.shared_get("counter")          # 42
-alty.shared_delete("counter")
+@alty.on("didReceiveNewMessages")
+def handle_new_messages(args):
+    for dialog_id, messages, _ in args:
+        process(dialog_id, messages)
 ```
 
-Хранится в `altylib_shared_store.json`.
+* Декоратор автоматически подбирает сигнатуру делегата и отписывается при выгрузке плагина.
+* Колбэк может принимать `(account, args)` или только `args` — сигнатура распознаётся по количеству параметров.
 
 ---
 
-## 6. Хуки и вспомогательные функции
+## Диагностика и хот-ридлоад
 
-| API | Кратко |
-|-----|--------|
-| `add_tg_alias(path, cb)` | Свой `tg://<path>` |
-| `detect_client()` | `exteragram` / `ayugram` |
-| `detect_language()` | `en`, `ru`, … |
-| `get_current_activity()` | Текущая `Activity` или `None` |
-| `get_plugins_dirs()` | Список путей с плагинами |
+* `install_crash_reporter(path=None)` — перехватывает необработанные исключения, сохраняет лог и показывает уведомление.
+* `enable_hot_reload(*modules)` + `reload_current_plugin()` — кнопка горячей перезагрузки модулей плагина.
+* Логгер (`alty.log`, `alty.logcat`) дополняет отчёты, а панель диагностики показывает состояние очередей и хуков.
 
 ---
 
-## 7. Советы по разработке
+## Совместимость и feature flags
 
-1. **Всегда** ставьте `handle_outgoing_command` перед своей логикой — тогда новые глобальные команды автоматически работают во всех плагинах.  
-2. Для «общения» между плагинами предпочитайте Event Bus; если нужен ответ — RPC.  
-3. Не держите долгие циклы в собственных потоках — используйте `tasks_schedule`.  
-4. Проверяйте UI-функции на конкретной сборке: если `bulletin_info` не видно, переходите на `bulletin_success`.  
+```python
+alty.features_register("stories_effects", lambda: alty.detect_client() == "exteragram")
+if alty.features_has("stories_effects"):
+    enable_stories_effects()
+```
+
+* Регистрация детекторов через `features_register(name, detector)`.
+* Кэш значений очищается `features_clear_cache()`.
+* Полезно при различиях между версиями exteraGram/Telegram.
 
 ---
 
-### Обратная связь
+## Cookbook: готовые рецепты
 
-Если у вас есть идеи или баг-репорты — публикуйте их в ЛС канала **@AltyPlugins** или открывайте issue в репозитории.
+`alty.list_recipes()` возвращает словарь с описанием типовых сценариев:
+
+* **auto_responder** — автоответчик на новые сообщения (NotificationCenter + send_text).
+* **media_autosave** — скачивание и сохранение медиа с контролем скорости.
+* **quick_translate** — команда `.translate` с кешированием TTL и ответом в чат.
+
+Рецепты служат отправной точкой для собственных плагинов: изучите шаги и адаптируйте под свои задачи.
+
+---
+
+## FAQ и обратная связь
+
+* Документация и примеры: [plugins.exteragram.app/docs](https://plugins.exteragram.app/docs)
+* Вопросы и предложения — в ЛС канала **@AltyPlugins** или через issues репозитория.
