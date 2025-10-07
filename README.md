@@ -54,17 +54,15 @@ class Hello(BasePlugin):
         alty.register_command("hello", self.cmd_hello, "Поздороваться")
         alty.events_subscribe("hello:ping", lambda _data: alty.bulletin_success(f"Pong from {__id__}!"))
 
-    # -- команды ----------------------------------------------------
     def cmd_hello(self, _self_pl, args, params):
         if not self.settings.get("enabled"):
             return "Команда выключена"
         alty.events_publish("hello:ping", None)
         return "Hello from AltyLib!"
 
-    # -- перехват исходящих сообщений -------------------------------
     def on_send_message_hook(self, account, params):
-        res = alty.handle_outgoing_command(self, account, params)
-        return res or HookResult()
+        result = alty.handle_outgoing_command(self, account, params)
+        return result or HookResult()
 ```
 
 * `create_settings_registry()` создаёт DSL-реестр настроек и связанное хранилище.
@@ -182,13 +180,14 @@ settings.open()
 
 ### 6.1. Event Bus
 
-| Функция | Описание |
-|---------|----------|
-| `events_subscribe(event, callback)` | Подписка. Callback(data) |
-| `events_unsubscribe(event, callback)` | Отписка |
-| `events_publish(event, data, *, async_call=True)` | Рассылка события |
+```python
+store = alty.KVStore("my_plugin")
+store.set("counter", 1)
+value = store.get("counter", 0)
+```
 
-> Внутри асинхронный вызов идёт через `run_on_queue`, поэтому обработчики не блокируют UI.
+* Значения сохраняются в JSON рядом с плагином, поддерживают примитивы и dict/list.
+* Доступны готовые экземпляры: `alty.store_global` (общий namespace) и отдельные для DSL настроек.
 
 ### 6.2. Управление командами
 
@@ -210,14 +209,22 @@ settings.open()
 ### 6.3. Планировщик задач
 
 ```python
-def my_job():
-    alty.log("Tick!")
+settings = alty.create_settings_registry("hello", title="Настройки Hello")
 
-# каждые 300 с, без немедленного старта
-alty.tasks_schedule("my_job", my_job, 300)
+@settings.switch(default=True, summary="Включить ответы")
+def enabled(value: bool):
+    alty.log(f"Enabled: {value}")
 
-# отмена
-alty.tasks_cancel("my_job")
+@settings.list(options=[("Быстро", "fast"), ("Медленно", "slow")], default="fast")
+def mode(choice):
+    alty.log(f"Mode set to {choice}")
+
+@settings.slider(min_value=0, max_value=10, step=1, default=3)
+def retries(value: float):
+    alty.log(f"Retries: {value}")
+
+# Показать экран настроек в UI
+settings.open()
 ```
 
 – Внутренний поток-планировщик пробуждается каждую секунду.
@@ -225,13 +232,14 @@ alty.tasks_cancel("my_job")
 
 ### 6.4. RPC-реестр
 
-```python
-# — в плагине-провайдере —
-alty.rpc_register("math.add", lambda a, b: a + b)
+* `resolve_peer("@username" | 123456789 | "-100…") -> TL_inputPeer` — универсальный резолвер ID/username.
+* `current_dialog()` — активный диалог (если доступен), `pick_dialog()` — UI-диалог выбора получателя.
+* `send_text(peer, text, reply_to=None, entities=None, silent=False)` — безопасная отправка сообщений.
+* Тайп-хелперы для `MessagesController`, `SendMessagesHelper`, `NotificationCenter` и др. доступны через прямые функции (`get_messages_controller`, `send_request`, `load_dialogs`, и т.п.).
 
-# — в другом плагине —
-res = alty.rpc_call("math.add", 5, 7)   # 12
-```
+---
+
+## Хуки и жизненный цикл
 
 Если функция не найдена — возбуждается `RuntimeError`.
 
