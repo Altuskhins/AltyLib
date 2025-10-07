@@ -1,11 +1,39 @@
+import argparse
+import atexit
 import copy
 import time
 import json
+import os
 import os.path
 import threading
 import traceback
+import contextlib
+import functools
+import inspect
+import math
+import heapq
+import itertools
+import queue
+import uuid
+from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
-from typing import List, Callable, Optional, Any
+from datetime import datetime, timedelta
+from functools import wraps
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+
+from PIL import Image
 
 from ui.bulletin import BulletinHelper
 from ui.settings import Divider, Header, Switch, Input
@@ -38,12 +66,26 @@ __all__ = (
     "get_plugins_dirs", #get plugin locations
     "get_current_activity", "bulletin_info", "bulletin_error", "bulletin_success", #bulletin helpers
     "show_spinner", "hide_spinner", #spinner dialog helpers
-    "add_tg_alias", "remove_tg_alias", # custom tg:// scheme aliases 
+    "add_tg_alias", "remove_tg_alias", # custom tg:// scheme aliases
     "get_logs", "clear_logs", # retrieve / clear recent AltyLib log lines
     "events_subscribe", "events_unsubscribe", "events_publish", # event bus
     "register_command", "handle_outgoing_command", "get_registered_commands", # command manager
     "tasks_schedule", "tasks_cancel", "tasks_list", # task scheduler
-    "rpc_register", "rpc_call" # intra-plugin RPC
+    "rpc_register", "rpc_call", # intra-plugin RPC
+    "SettingsRegistry", "create_settings_registry", "open_settings_screen", # settings DSL
+    "send_text", "resolve_peer", "current_dialog", "pick_dialog", # typed controllers helpers
+    "HookLifecycle", "HookGroup", "safe_hook", "safe_unhook_all", # hook lifecycle utilities
+    "debounce", "throttle", "RateLimiter", "priority_queue_worker", # rate limit utilities
+    "md", "split_text", # markdown helpers
+    "KVStore", "TTLCache", "store_global", # storage helpers
+    "download_media", "save_to_gallery", "with_image", # media helpers
+    "snackbar_info", "snackbar_warn", "snackbar_error", "snackbar_undo", "quick_list_pick", "show_bottom_sheet", "copy_to_clipboard", # ui helpers
+    "on", # notification observers
+    "altylib_cli", "init_plugin_scaffold", "validate_plugin_manifest", # cli helpers
+    "CrashReporter", "install_crash_reporter", # diagnostics
+    "enable_hot_reload", "reload_current_plugin", # debug helpers
+    "features_has", "features_register", "features_clear_cache", # compatibility helpers
+    "load_recipe", "list_recipes" # cookbook
 )
 
 
@@ -1212,3 +1254,1615 @@ def rpc_call(name: str, *args, **kwargs):
     if not fn:
         raise RuntimeError(f"RPC: function '{name}' not found")
     return fn(*args, **kwargs)
+
+
+# === Persistent Storage Helpers ======================================================
+
+
+class KVStore:
+    """Small JSON-backed key/value store with thread-safety and deepcopy semantics."""
+
+    def __init__(self, name: str, *, default: Optional[dict] = None, autosave: bool = True):
+        if not name:
+            raise ValueError("name must be provided")
+        if name.endswith(".json"):
+            filename = name
+        else:
+            filename = f"{name}.json"
+        self._file = JsonCacheFile(filename, default or {})
+        self._lock = threading.RLock()
+        # copy initial data to avoid accidental mutation
+        self._data: Dict[str, Any] = copy.deepcopy(self._file.content)
+        self._autosave = autosave
+
+    def _write(self):
+        self._file.content = copy.deepcopy(self._data)
+        self._file.write()
+
+    def flush(self):
+        with self._lock:
+            self._write()
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+            if self._autosave:
+                self._write()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            return copy.deepcopy(self._data.get(key, default))
+
+    def set(self, key: str, value: Any):
+        with self._lock:
+            self._data[key] = copy.deepcopy(value)
+            if self._autosave:
+                self._write()
+
+    def pop(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            value = self._data.pop(key, default)
+            if self._autosave:
+                self._write()
+            return copy.deepcopy(value)
+
+    def update(self, mapping: Dict[str, Any]):
+        with self._lock:
+            for key, value in mapping.items():
+                self._data[key] = copy.deepcopy(value)
+            if self._autosave:
+                self._write()
+
+    def items(self):
+        with self._lock:
+            return [(k, copy.deepcopy(v)) for k, v in self._data.items()]
+
+    def __getitem__(self, key: str) -> Any:
+        with self._lock:
+            return copy.deepcopy(self._data[key])
+
+    def __setitem__(self, key: str, value: Any):
+        self.set(key, value)
+
+    def __contains__(self, key: str) -> bool:
+        with self._lock:
+            return key in self._data
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+
+class TTLCache:
+    """In-memory cache with TTL support and optional size limiting."""
+
+    def __init__(self, *, default_ttl: Optional[float] = None, maxsize: Optional[int] = 256):
+        self.default_ttl = default_ttl
+        self.maxsize = maxsize
+        self._data: Dict[Any, Tuple[Any, Optional[float]]] = {}
+        self._expiry_heap: List[Tuple[float, Any]] = []
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _now() -> float:
+        return time.time()
+
+    def _purge_expired(self):
+        if not self._expiry_heap:
+            return
+        now = self._now()
+        while self._expiry_heap and self._expiry_heap[0][0] <= now:
+            expiry, key = heapq.heappop(self._expiry_heap)
+            entry = self._data.get(key)
+            if entry and entry[1] == expiry:
+                self._data.pop(key, None)
+
+    def _evict_lru(self):
+        if self.maxsize and len(self._data) > self.maxsize:
+            # drop the oldest item by expiry heap or arbitrary
+            if self._expiry_heap:
+                _, key = heapq.heappop(self._expiry_heap)
+                self._data.pop(key, None)
+            else:
+                # fall back to FIFO order
+                key = next(iter(self._data.keys()))
+                self._data.pop(key, None)
+
+    def set(self, key: Any, value: Any, *, ttl: Optional[float] = None):
+        ttl_value = ttl if ttl is not None else self.default_ttl
+        expire_at = None
+        if ttl_value:
+            expire_at = self._now() + float(ttl_value)
+        with self._lock:
+            self._data[key] = (copy.deepcopy(value), expire_at)
+            if expire_at is not None:
+                heapq.heappush(self._expiry_heap, (expire_at, key))
+            self._evict_lru()
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        with self._lock:
+            self._purge_expired()
+            entry = self._data.get(key)
+            if not entry:
+                return default
+            return copy.deepcopy(entry[0])
+
+    def pop(self, key: Any, default: Any = None) -> Any:
+        with self._lock:
+            self._purge_expired()
+            entry = self._data.pop(key, None)
+            if not entry:
+                return default
+            return copy.deepcopy(entry[0])
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+            self._expiry_heap.clear()
+
+    def get_or_set(self, key: Any, loader: Callable[[], Any], *, ttl: Optional[float] = None):
+        sentinel = object()
+        value = self.get(key, sentinel)
+        if value is not sentinel:
+            return value
+        value = loader()
+        self.set(key, value, ttl=ttl)
+        return value
+
+
+store_global = KVStore("altylib_global_store")
+
+
+# === Settings DSL ===================================================================
+
+
+@dataclass
+class _SettingDefinition:
+    key: str
+    type: str
+    title: str
+    summary: Optional[str]
+    default: Any
+    options: Optional[Sequence[Tuple[str, Any]]] = None
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    step: Optional[float] = None
+    callback: Optional[Callable[[Any], None]] = None
+
+
+class SettingHandle:
+    def __init__(self, registry: "SettingsRegistry", definition: _SettingDefinition):
+        self._registry = registry
+        self.definition = definition
+
+    def get(self, default: Any = None) -> Any:
+        return self._registry.get(self.definition.key, default)
+
+    def set(self, value: Any):
+        self._registry.set(self.definition.key, value)
+        return value
+
+    def toggle(self) -> bool:
+        if self.definition.type != "switch":
+            raise TypeError("toggle() available only for switch settings")
+        value = not bool(self.get())
+        self.set(value)
+        return value
+
+    @property
+    def value(self):
+        return self.get()
+
+    @value.setter
+    def value(self, val):
+        self.set(val)
+
+
+class SettingsRegistry:
+    """Declarative mini-DSL for describing plugin settings."""
+
+    def __init__(self, namespace: str, *, title: Optional[str] = None, store: Optional[KVStore] = None):
+        self.namespace = namespace
+        self.title = title or namespace
+        self.store = store or KVStore(f"settings_{namespace}")
+        self._definitions: List[_SettingDefinition] = []
+        self._handles: Dict[str, SettingHandle] = {}
+
+    # Decorators -----------------------------------------------------------------
+
+    def switch(
+        self,
+        key: Optional[str] = None,
+        *,
+        default: bool = False,
+        title: Optional[str] = None,
+        summary: Optional[str] = None,
+        on_change: Optional[Callable[[bool], None]] = None,
+    ):
+        def decorator(func: Optional[Callable[[bool], None]] = None):
+            setting_key = key or (func.__name__ if func else None)
+            if not setting_key:
+                raise ValueError("switch decorator requires key or callable with name")
+            definition = _SettingDefinition(
+                key=setting_key,
+                type="switch",
+                title=title or setting_key.replace("_", " ").title(),
+                summary=summary,
+                default=bool(default),
+                callback=on_change or func,
+            )
+            return self._register(definition)
+
+        if callable(key):
+            func = key  # type: ignore[assignment]
+            key = None
+            return decorator(func)
+
+        return decorator
+
+    def list(
+        self,
+        key: Optional[str] = None,
+        *,
+        options: Optional[Sequence[Tuple[str, Any]]] = None,
+        default: Any = None,
+        title: Optional[str] = None,
+        summary: Optional[str] = None,
+        on_change: Optional[Callable[[Any], None]] = None,
+    ):
+        def decorator(func: Optional[Callable[[Any], None]] = None):
+            setting_key = key or (func.__name__ if func else None)
+            if not setting_key:
+                raise ValueError("list decorator requires key or callable with name")
+            normalized_options: List[Tuple[str, Any]] = []
+            if options:
+                for opt in options:
+                    if isinstance(opt, tuple):
+                        normalized_options.append(opt)
+                    else:
+                        normalized_options.append((str(opt), opt))
+            definition = _SettingDefinition(
+                key=setting_key,
+                type="list",
+                title=title or setting_key.replace("_", " ").title(),
+                summary=summary,
+                default=default,
+                options=normalized_options,
+                callback=on_change or func,
+            )
+            return self._register(definition)
+
+        if callable(key):
+            func = key  # type: ignore[assignment]
+            key = None
+            return decorator(func)
+        return decorator
+
+    def slider(
+        self,
+        key: Optional[str] = None,
+        *,
+        min_value: float = 0.0,
+        max_value: float = 1.0,
+        step: float = 1.0,
+        default: float = 0.0,
+        title: Optional[str] = None,
+        summary: Optional[str] = None,
+        on_change: Optional[Callable[[float], None]] = None,
+    ):
+        def decorator(func: Optional[Callable[[float], None]] = None):
+            setting_key = key or (func.__name__ if func else None)
+            if not setting_key:
+                raise ValueError("slider decorator requires key or callable with name")
+            definition = _SettingDefinition(
+                key=setting_key,
+                type="slider",
+                title=title or setting_key.replace("_", " ").title(),
+                summary=summary,
+                default=float(default),
+                min_value=float(min_value),
+                max_value=float(max_value),
+                step=float(step) if step else 1.0,
+                callback=on_change or func,
+            )
+            return self._register(definition)
+
+        if callable(key):
+            func = key  # type: ignore[assignment]
+            key = None
+            return decorator(func)
+        return decorator
+
+    # Core API -------------------------------------------------------------------
+
+    def _register(self, definition: _SettingDefinition) -> SettingHandle:
+        if definition.key in self._handles:
+            return self._handles[definition.key]
+        if definition.key not in self.store:
+            self.store.set(definition.key, copy.deepcopy(definition.default))
+        handle = SettingHandle(self, definition)
+        self._definitions.append(definition)
+        self._handles[definition.key] = handle
+        return handle
+
+    def keys(self) -> List[str]:
+        return list(self._handles.keys())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self.store:
+            return self.store.get(key)
+        return default
+
+    def set(self, key: str, value: Any):
+        old = self.get(key)
+        self.store.set(key, value)
+        if old != value:
+            handle = self._handles.get(key)
+            if handle:
+                self._notify(handle.definition, value)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {key: self.get(key) for key in self.keys()}
+
+    def _notify(self, definition: _SettingDefinition, value: Any):
+        callback = definition.callback
+        if not callback:
+            return
+        try:
+            callback(value)
+        except Exception:
+            log(f"SettingsRegistry callback for '{definition.key}' failed: {traceback.format_exc().rstrip()}")
+
+    # UI -------------------------------------------------------------------------
+
+    def open(self, *, title: Optional[str] = None):
+        open_settings_screen(self, title=title or self.title)
+
+
+def create_settings_registry(namespace: str, **kwargs) -> SettingsRegistry:
+    return SettingsRegistry(namespace, **kwargs)
+
+
+def _format_setting_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "On" if value else "Off"
+    if isinstance(value, (int, float)):
+        if abs(value) >= 1000:
+            return f"{value:,.0f}".replace(",", " ")
+        return str(round(value, 2)).rstrip("0").rstrip(".") if isinstance(value, float) else str(value)
+    if value is None:
+        return "—"
+    return str(value)
+
+
+def open_settings_screen(registry: SettingsRegistry, *, title: Optional[str] = None):
+    activity = get_current_activity()
+    if activity is None:
+        log("SettingsRegistry: cannot open settings without active activity")
+        return
+
+    definitions = list(registry._definitions)
+    if not definitions:
+        bulletin_info("Нет доступных настроек")
+        return
+
+    items: List[str] = []
+    actions: List[Callable[[], None]] = []
+
+    for definition in definitions:
+        value = registry.get(definition.key, definition.default)
+        label = f"{definition.title}: {_format_setting_value(value)}"
+        if definition.summary:
+            label += f"\n{definition.summary}"
+        items.append(label)
+
+        if definition.type == "switch":
+            def make_switch(defn: _SettingDefinition):
+                def action():
+                    current = bool(registry.get(defn.key, defn.default))
+                    registry.set(defn.key, not current)
+                    open_settings_screen(registry, title=title)
+
+                return action
+
+            actions.append(make_switch(definition))
+        elif definition.type == "list":
+            def make_list(defn: _SettingDefinition):
+                def action():
+                    options = defn.options or []
+                    if not options:
+                        bulletin_warn = getattr(BulletinHelper, "show_warning", None)
+                        if bulletin_warn:
+                            bulletin_warn("Нет вариантов для выбора")
+                        return
+                    builder = AlertDialogBuilder(activity)
+                    builder.setTitle(defn.title)
+                    entries = [opt[0] for opt in options]
+
+                    def on_select(index: int):
+                        try:
+                            value = options[index][1]
+                        except IndexError:
+                            return
+                        registry.set(defn.key, value)
+
+                    builder.setItems(entries, Callback1(on_select))
+                    builder.setNegativeButton("Отмена", None)
+                    builder.show()
+
+                return action
+
+            actions.append(make_list(definition))
+        elif definition.type == "slider":
+            def make_slider(defn: _SettingDefinition):
+                def action():
+                    min_v = defn.min_value if defn.min_value is not None else 0
+                    max_v = defn.max_value if defn.max_value is not None else 100
+                    step = defn.step or 1
+                    current = float(registry.get(defn.key, defn.default))
+                    values: List[float] = []
+                    if max_v > min_v:
+                        steps = int((max_v - min_v) / step) if step else 0
+                        if step and steps <= 200:
+                            value = min_v
+                            while value <= max_v + 1e-9:
+                                values.append(round(value, 6))
+                                value += step
+                        else:
+                            # fallback to around current range
+                            low = max(min_v, current - step * 25)
+                            high = min(max_v, current + step * 25)
+                            value = low
+                            while value <= high + 1e-9:
+                                values.append(round(value, 6))
+                                value += step or 1
+                    if not values:
+                        values = [current]
+
+                    builder = AlertDialogBuilder(activity)
+                    builder.setTitle(defn.title)
+                    display = [str(v) for v in values]
+
+                    def on_select(index: int):
+                        try:
+                            value = values[index]
+                        except IndexError:
+                            return
+                        registry.set(defn.key, value)
+
+                    builder.setItems(display, Callback1(on_select))
+                    builder.setNegativeButton("Отмена", None)
+                    builder.show()
+
+                return action
+
+            actions.append(make_slider(definition))
+        else:
+            actions.append(lambda: None)
+
+    builder = AlertDialogBuilder(activity)
+    builder.setTitle(title or registry.title)
+    builder.setItems(items, Callback1(lambda index: actions[index]() if index < len(actions) else None))
+    builder.setNegativeButton("Закрыть", None)
+    builder.show()
+
+
+# === Typed controller helpers =======================================================
+
+
+if TYPE_CHECKING:  # pragma: no cover - used only for typing assistance
+    from org.telegram.tgnet import TLRPC as _TLRPC
+    from org.telegram.ui import ActionBar as _ActionBar
+
+
+def _get_messages_controller():
+    controller = get_messages_controller()
+    if controller is None:
+        raise RuntimeError("MessagesController instance is not available")
+    return controller
+
+
+def _as_input_peer(peer_obj):
+    controller = _get_messages_controller()
+    get_input_peer = getattr(controller, "getInputPeer", None)
+    if callable(get_input_peer):
+        return get_input_peer(peer_obj)
+    return peer_obj
+
+
+def resolve_peer(peer_like: Union[str, int, Any]):
+    """Resolve peer from id, dialog or username string."""
+
+    controller = _get_messages_controller()
+
+    if peer_like is None:
+        return None
+
+    # Already an input peer
+    if peer_like.__class__.__name__.startswith("TL_inputPeer"):
+        return peer_like
+
+    if hasattr(peer_like, "dialog_id"):
+        return _as_input_peer(getattr(peer_like, "dialog_id"))
+
+    if hasattr(peer_like, "id") and not isinstance(peer_like, (str, int)):
+        return _as_input_peer(getattr(peer_like, "id"))
+
+    if isinstance(peer_like, int):
+        return _as_input_peer(peer_like)
+
+    if isinstance(peer_like, str):
+        text = peer_like.strip()
+        if not text:
+            return None
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return _as_input_peer(int(text))
+        if text.startswith("-100") and text[1:].isdigit():
+            return _as_input_peer(int(text))
+        if text.startswith("@"):
+            username = text[1:]
+            request = TLRPC.TL_contacts_resolveUsername()
+            request.username = username
+            event = threading.Event()
+            resolved = {}
+
+            def callback(response, error):
+                try:
+                    if error is not None or response is None:
+                        resolved["error"] = error
+                        return
+                    peer = None
+                    if getattr(response, "chats", None) and response.chats.size() > 0:
+                        chat = response.chats.get(0)
+                        peer = controller.getInputPeer(-chat.id if getattr(chat, "megagroup", False) else -chat.id)
+                    elif getattr(response, "users", None) and response.users.size() > 0:
+                        user = response.users.get(0)
+                        peer = controller.getInputPeer(user.id)
+                    resolved["peer"] = peer
+                finally:
+                    event.set()
+
+            send_request(request, callback)
+            event.wait(5)
+            if "peer" in resolved:
+                return resolved["peer"]
+            raise RuntimeError(f"Не удалось разрешить пользователя @{username}")
+        raise ValueError(f"Unsupported peer identifier: {peer_like}")
+
+    return _as_input_peer(peer_like)
+
+
+def current_dialog():
+    """Return input peer for currently opened dialog if available."""
+
+    fragment = get_last_fragment()
+    if fragment is None:
+        return None
+    dialog_id = None
+    if hasattr(fragment, "getDialogId") and callable(getattr(fragment, "getDialogId")):
+        try:
+            dialog_id = fragment.getDialogId()
+        except Exception:
+            dialog_id = None
+    if dialog_id is None and hasattr(fragment, "getDialogIdLong"):
+        try:
+            dialog_id = fragment.getDialogIdLong()
+        except Exception:
+            dialog_id = None
+    if dialog_id is None:
+        return None
+    return resolve_peer(dialog_id)
+
+
+def pick_dialog(
+    identifier: Optional[Union[str, int]] = None,
+    *,
+    title: str = "Выберите чат",
+    on_result: Optional[Callable[[Any], None]] = None,
+    allow_manual_input: bool = True,
+):
+    """Pick dialog by identifier or via simple prompt."""
+
+    if identifier is not None:
+        peer = resolve_peer(identifier)
+        if on_result:
+            on_result(peer)
+        return peer
+
+    current = current_dialog()
+    if current and not allow_manual_input:
+        if on_result:
+            on_result(current)
+        return current
+
+    activity = get_current_activity()
+    if activity is None or not allow_manual_input:
+        if on_result:
+            on_result(current)
+        return current
+
+    builder = AlertDialogBuilder(activity)
+    builder.setTitle(title)
+
+    input_view = None
+    try:
+        EditText = find_class("android.widget.EditText")
+        input_view = EditText(activity)
+        input_view.setHint("@username или ID")
+        builder.setView(input_view)
+    except Exception:
+        input_view = None
+
+    def _handle_input(_=None):
+        text_value = None
+        if input_view is not None:
+            try:
+                text_value = input_view.getText().toString()
+            except Exception:
+                text_value = None
+        if not text_value:
+            peer = current
+        else:
+            try:
+                peer = resolve_peer(text_value)
+            except Exception as exc:
+                bulletin_error = getattr(BulletinHelper, "show_error", None)
+                if bulletin_error:
+                    bulletin_error(str(exc))
+                else:
+                    log(f"pick_dialog: {exc}")
+                peer = None
+        if on_result:
+            on_result(peer)
+
+    builder.setPositiveButton("Готово", Callback1(_handle_input))
+    builder.setNegativeButton("Отмена", None)
+    builder.show()
+
+    return current
+
+
+def send_text(
+    peer: Union[str, int, Any],
+    text: str,
+    *,
+    reply_to: Optional[Union[int, Any]] = None,
+    entities: Optional[Iterable[Any]] = None,
+    silent: bool = False,
+):
+    """Send text message to peer using TL request helper."""
+
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+
+    input_peer = resolve_peer(peer)
+    if input_peer is None:
+        raise RuntimeError("Не удалось определить получателя")
+
+    req = TLRPC.TL_messages_sendMessage()
+    req.peer = input_peer
+    req.message = text
+    req.random_id = Utilities.random.nextLong()
+    if reply_to is not None:
+        if isinstance(reply_to, int):
+            req.reply_to_msg_id = reply_to
+        elif hasattr(reply_to, "id"):
+            req.reply_to_msg_id = getattr(reply_to, "id")
+
+    if entities:
+        try:
+            ArrayList = find_class("java.util.ArrayList")
+            java_list = ArrayList()
+            for entity in entities:
+                java_list.add(entity)
+            req.entities = java_list
+        except Exception:
+            log("send_text: failed to attach entities; sending without them")
+
+    if silent:
+        req.silent = True
+
+    send_request(req, lambda *_: None)
+
+    return req.random_id
+
+
+# === Safe Hook Lifecycle Manager ====================================================
+
+
+class HookRegistration:
+    def __init__(self, plugin: Optional[BasePlugin], method, hook: MethodHook, *, key: str):
+        self.plugin = plugin
+        self.method = method
+        self.hook = hook
+        self.key = key
+        self.active = True
+
+    def cancel(self):
+        if not self.active:
+            return
+        try:
+            unhook = getattr(self.hook, "unhook", None)
+            if callable(unhook):
+                unhook()
+        except Exception:
+            log(f"HookRegistration cancel failed for {self.key}: {traceback.format_exc().rstrip()}")
+        self.active = False
+
+
+class HookGroup:
+    def __init__(self, name: str = "default"):
+        self.name = name
+        self._registrations: List[HookRegistration] = []
+
+    def add(self, registration: HookRegistration):
+        if registration not in self._registrations:
+            self._registrations.append(registration)
+
+    def cancel_all(self):
+        for registration in list(self._registrations):
+            registration.cancel()
+        self._registrations.clear()
+
+
+class HookLifecycle:
+    def __init__(self):
+        self._groups: Dict[str, HookGroup] = {}
+
+    def group(self, name: str) -> HookGroup:
+        grp = self._groups.get(name)
+        if not grp:
+            grp = HookGroup(name)
+            self._groups[name] = grp
+        return grp
+
+    def cancel_all(self):
+        for grp in list(self._groups.values()):
+            grp.cancel_all()
+        self._groups.clear()
+
+
+_HOOK_REGISTRY: Dict[str, HookRegistration] = {}
+_HOOK_REGISTRY_LOCK = threading.RLock()
+
+
+def _make_hook_key(method) -> str:
+    try:
+        declaring = method.getDeclaringClass().getName()
+    except Exception:
+        declaring = str(getattr(method, "__qualname__", method))
+    try:
+        param_types = [p.getName() for p in method.getParameterTypes()]
+    except Exception:
+        param_types = []
+    return "::".join([declaring, getattr(method, "getName", lambda: str(method))(), ",".join(param_types)])
+
+
+def _resolve_method(target_class, method_name: str, signature: Optional[Sequence[str]]):
+    methods = []
+    try:
+        methods.extend(list(target_class.getDeclaredMethods()))
+    except Exception:
+        pass
+    try:
+        methods.extend(list(target_class.getMethods()))
+    except Exception:
+        pass
+    for method in methods:
+        try:
+            if method.getName() != method_name:
+                continue
+            if signature:
+                params = [p.getName() for p in method.getParameterTypes()]
+                if list(signature) != params:
+                    continue
+            return method
+        except Exception:
+            continue
+    raise RuntimeError(f"Method {method_name} not found on {target_class}")
+
+
+def safe_hook(
+    plugin: Optional[BasePlugin],
+    target: Union[str, Any],
+    method_name: str,
+    hook: MethodHook,
+    *,
+    signature: Optional[Sequence[str]] = None,
+    group: Optional[HookGroup] = None,
+    once: bool = True,
+):
+    if isinstance(target, str):
+        target_class = find_class(target)
+    else:
+        target_class = target
+    method = _resolve_method(target_class, method_name, signature)
+    key = _make_hook_key(method)
+    with _HOOK_REGISTRY_LOCK:
+        existing = _HOOK_REGISTRY.get(key)
+        if once and existing and existing.active:
+            log(f"safe_hook: hook already registered for {key}")
+            if group and existing not in group._registrations:
+                group.add(existing)
+            return existing
+
+    if plugin is not None:
+        try:
+            plugin.hook_method(method, hook)
+        except Exception:
+            log(f"safe_hook: failed to hook {key}: {traceback.format_exc().rstrip()}")
+            raise
+    else:
+        try:
+            hook.hook_method(method)
+        except Exception:
+            log(f"safe_hook: failed to hook (no plugin) {key}: {traceback.format_exc().rstrip()}")
+            raise
+
+    registration = HookRegistration(plugin, method, hook, key=key)
+    if group:
+        group.add(registration)
+    with _HOOK_REGISTRY_LOCK:
+        _HOOK_REGISTRY[key] = registration
+    return registration
+
+
+def safe_unhook_all():
+    with _HOOK_REGISTRY_LOCK:
+        registrations = list(_HOOK_REGISTRY.values())
+        _HOOK_REGISTRY.clear()
+    for registration in registrations:
+        registration.cancel()
+
+
+# === Debounce & Rate limit utilities ================================================
+
+
+def debounce(wait_seconds: float, *, leading: bool = False):
+    """Decorator to debounce function calls."""
+
+    def decorator(func):
+        lock = threading.RLock()
+        state = {"timer": None}
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            def run():
+                with lock:
+                    state["timer"] = None
+                if not leading:
+                    func(*args, **kwargs)
+
+            with lock:
+                timer = state.get("timer")
+                if timer is not None:
+                    timer.cancel()
+                elif leading:
+                    func(*args, **kwargs)
+                timer = threading.Timer(wait_seconds, run)
+                timer.daemon = True
+                state["timer"] = timer
+                timer.start()
+
+        return wrapper
+
+    return decorator
+
+
+def throttle(interval: float):
+    """Decorator to throttle function execution to once per interval."""
+
+    def decorator(func):
+        lock = threading.RLock()
+        state = {"last": 0.0, "scheduled": False, "args": None, "kwargs": None}
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            with lock:
+                if now - state["last"] >= interval:
+                    state["last"] = now
+                    func(*args, **kwargs)
+                    return
+                state["args"] = args
+                state["kwargs"] = kwargs
+                if state["scheduled"]:
+                    return
+                delay = interval - (now - state["last"])
+                state["scheduled"] = True
+
+            def run():
+                with lock:
+                    state["scheduled"] = False
+                    state["last"] = time.time()
+                    args_, kwargs_ = state["args"], state["kwargs"]
+                func(*args_, **kwargs_)
+
+            timer = threading.Timer(delay, run)
+            timer.daemon = True
+            timer.start()
+
+        return wrapper
+
+    return decorator
+
+
+class RateLimiter:
+    def __init__(self, rate: int, per_seconds: float):
+        if rate <= 0:
+            raise ValueError("rate must be positive")
+        self.rate = rate
+        self.per_seconds = float(per_seconds)
+        self._timestamps = deque(maxlen=rate)
+        self._lock = threading.RLock()
+
+    def acquire(self):
+        with self._lock:
+            now = time.time()
+            if len(self._timestamps) < self.rate:
+                self._timestamps.append(now)
+                return 0.0
+            oldest = self._timestamps[0]
+            wait = oldest + self.per_seconds - now
+            if wait <= 0:
+                self._timestamps.append(now)
+                return 0.0
+            self._timestamps.append(now + wait)
+            return max(0.0, wait)
+
+    def run(self, func: Callable, *args, **kwargs):
+        wait_time = self.acquire()
+        if wait_time > 0:
+            time.sleep(wait_time)
+        return func(*args, **kwargs)
+
+
+def priority_queue_worker():
+    """Create a background worker that processes queued callables with priorities."""
+
+    task_queue: "queue.PriorityQueue[Tuple[int, int, Callable[[], None]]]" = queue.PriorityQueue()
+    counter = itertools.count()
+
+    def submit(callback: Callable[[], None], *, priority: int = 10):
+        task_queue.put((priority, next(counter), callback))
+
+    def worker():
+        while True:
+            try:
+                priority, _, callback = task_queue.get()
+            except Exception:
+                continue
+            try:
+                callback()
+            except Exception:
+                log(f"priority_queue_worker: task error: {traceback.format_exc().rstrip()}")
+            finally:
+                task_queue.task_done()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return submit
+
+
+# === Markdown helpers ===============================================================
+
+
+_MARKDOWN_TOKENS = {
+    "**": "bold",
+    "__": "underline",
+    "~~": "strikethrough",
+    "``": "code",
+    "`": "code",
+}
+
+
+def _extract_links(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    import re
+
+    pattern = re.compile(r"\\[([^\\]]+)\\]\\(([^\\)]+)\\)")
+    entities: List[Dict[str, Any]] = []
+    plain_parts: List[str] = []
+    last = 0
+    for match in pattern.finditer(text):
+        plain_parts.append(text[last : match.start()])
+        label = match.group(1)
+        url = match.group(2)
+        start = len("".join(plain_parts))
+        plain_parts.append(label)
+        end = len("".join(plain_parts))
+        entities.append({"type": "text_url", "start": start, "end": end, "url": url})
+        last = match.end()
+    plain_parts.append(text[last:])
+    return "".join(plain_parts), entities
+
+
+def _parse_inline_entities(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    plain_chars: List[str] = []
+    entities: List[Dict[str, Any]] = []
+    stacks: Dict[str, List[int]] = {token: [] for token in _MARKDOWN_TOKENS}
+
+    i = 0
+    length = len(text)
+    while i < length:
+        matched = False
+        for token, entity_type in _MARKDOWN_TOKENS.items():
+            if not text.startswith(token, i):
+                continue
+            closing_index = text.find(token, i + len(token))
+            if closing_index == -1:
+                continue
+            stack = stacks[token]
+            if stack:
+                start = stack.pop()
+                end = len(plain_chars)
+                if end > start:
+                    entities.append({"type": entity_type, "start": start, "end": end})
+            else:
+                stack.append(len(plain_chars))
+            i += len(token)
+            matched = True
+            break
+        if matched:
+            continue
+        plain_chars.append(text[i])
+        i += 1
+
+    # Append unmatched tokens as literal characters
+    for token, stack in stacks.items():
+        while stack:
+            pos = stack.pop()
+            plain_chars.insert(pos, token)
+
+    return "".join(plain_chars), entities
+
+
+def _utf16_index(text: str, index: int) -> int:
+    return len(text[:index].encode("utf-16-le")) // 2
+
+
+def _convert_entities(plain_text: str, entities_meta: List[Dict[str, Any]]):
+    result = []
+    for meta in entities_meta:
+        start = _utf16_index(plain_text, meta["start"])
+        end = _utf16_index(plain_text, meta["end"])
+        length = max(0, end - start)
+        if length <= 0:
+            continue
+        entity_type = meta["type"]
+        try:
+            if entity_type == "bold":
+                entity = TLRPC.TL_messageEntityBold()
+            elif entity_type == "underline":
+                entity = TLRPC.TL_messageEntityUnderline()
+            elif entity_type == "strikethrough":
+                entity = TLRPC.TL_messageEntityStrike()
+            elif entity_type == "code":
+                entity = TLRPC.TL_messageEntityCode()
+            elif entity_type == "text_url":
+                entity = TLRPC.TL_messageEntityTextUrl()
+                entity.url = meta.get("url", "")
+            else:
+                continue
+        except Exception:
+            continue
+        entity.offset = start
+        entity.length = length
+        result.append(entity)
+    return result
+
+
+def md(text: str) -> Tuple[str, List[Any]]:
+    """Parse simplified markdown string to Telegram text + entities."""
+
+    plain, entities = _extract_links(text)
+    plain, inline_entities = _parse_inline_entities(plain)
+    entities.extend(inline_entities)
+    tl_entities = _convert_entities(plain, entities)
+    return plain, tl_entities
+
+
+def split_text(text: str, *, limit: int = 4096) -> List[str]:
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    parts: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    def flush():
+        nonlocal current, current_len
+        if current:
+            parts.append("".join(current))
+            current = []
+            current_len = 0
+
+    for segment in text.splitlines(True):
+        segment_len = len(segment)
+        while segment_len > 0:
+            available = limit - current_len
+            if available <= 0:
+                flush()
+                available = limit
+            if segment_len <= available:
+                current.append(segment)
+                current_len += segment_len
+                segment_len = 0
+            else:
+                split_at = segment.rfind(" ", 0, available)
+                if split_at <= 0:
+                    split_at = available
+                current.append(segment[:split_at])
+                current_len += split_at
+                flush()
+                segment = segment[split_at:]
+                segment_len = len(segment)
+    flush()
+    return parts
+
+
+# === Media helpers ==================================================================
+
+
+def _ensure_path(path) -> str:
+    return str(path) if path is not None else ""
+
+
+def download_media(message, *, blocking: bool = False, priority: int = FileLoader.PRIORITY_NORMAL) -> Optional[str]:
+    """Download media from message and return local path."""
+
+    if message is None:
+        return None
+    media = getattr(message, "media", None)
+    if media is None:
+        return None
+    document = getattr(media, "document", None)
+    if document is None and hasattr(media, "getDocument"):
+        document = media.getDocument()
+    if document is None:
+        return None
+
+    loader = get_file_loader()
+    path = loader.getPathToAttach(document, True)
+    if path.exists():
+        return _ensure_path(path)
+
+    try:
+        loader.loadFile(document, "altylib_media", priority, 1)
+    except Exception:
+        log(f"download_media failed: {traceback.format_exc().rstrip()}")
+        return None
+
+    if blocking:
+        for _ in range(100):
+            if path.exists():
+                break
+            time.sleep(0.1)
+
+    return _ensure_path(path)
+
+
+def save_to_gallery(path: str):
+    if not path:
+        raise ValueError("path is required")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    try:
+        Utilities.addMediaToGallery(path)
+    except Exception:
+        try:
+            MediaController = find_class("org.telegram.messenger.MediaController")
+            MediaController.saveFile(path, False)
+        except Exception:
+            log(f"save_to_gallery failed: {traceback.format_exc().rstrip()}")
+
+
+def with_image(path: str, fn: Callable[[Image.Image], Any]):
+    if not callable(fn):
+        raise ValueError("fn must be callable")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    img = Image.open(path)
+    try:
+        result = fn(img)
+        if isinstance(result, Image.Image):
+            result.save(path)
+        return result
+    finally:
+        img.close()
+
+
+# === UI helpers =====================================================================
+
+
+def _bulletin_call(name: str, message: str):
+    fn = getattr(BulletinHelper, name, None)
+    if callable(fn):
+        fn(message)
+    else:
+        log(f"Bulletin {name} unavailable: {message}")
+
+
+def snackbar_info(message: str):
+    _bulletin_call("show_info", message)
+
+
+def snackbar_warn(message: str):
+    _bulletin_call("show_warning", message)
+
+
+def snackbar_error(message: str):
+    _bulletin_call("show_error", message)
+
+
+def snackbar_undo(message: str, *, on_undo: Optional[Callable[[], None]] = None):
+    activity = get_current_activity()
+    if activity is None:
+        snackbar_info(message)
+        return
+    builder = AlertDialogBuilder(activity)
+    builder.setTitle("Отмена действия")
+    builder.setMessage(message)
+    if on_undo:
+        builder.setPositiveButton("Отменить", Callback1(lambda _: on_undo()))
+    builder.setNegativeButton("Закрыть", None)
+    builder.show()
+
+
+def quick_list_pick(
+    options: Sequence[Union[str, Tuple[str, Any]]],
+    *,
+    title: str = "Выберите", 
+    on_select: Optional[Callable[[Any], None]] = None,
+    cancel_text: str = "Отмена",
+):
+    activity = get_current_activity()
+    if activity is None:
+        raise RuntimeError("Нет активного окна для отображения списка")
+    entries: List[str] = []
+    mapping: List[Any] = []
+    for opt in options:
+        if isinstance(opt, tuple):
+            entries.append(str(opt[0]))
+            mapping.append(opt[1])
+        else:
+            entries.append(str(opt))
+            mapping.append(opt)
+
+    builder = AlertDialogBuilder(activity)
+    builder.setTitle(title)
+
+    def handle(index: int):
+        if 0 <= index < len(mapping) and on_select:
+            on_select(mapping[index])
+
+    builder.setItems(entries, Callback1(handle))
+    builder.setNegativeButton(cancel_text, None)
+    builder.show()
+
+
+def show_bottom_sheet(
+    options: Sequence[Union[str, Tuple[str, Any]]],
+    *,
+    title: str = "Действия",
+    on_select: Optional[Callable[[Any], None]] = None,
+):
+    activity = get_current_activity()
+    if activity is None:
+        raise RuntimeError("Нет активного окна для отображения меню")
+    builder = AlertDialogBuilder(activity)
+    builder.setTitle(title)
+    try:
+        builder.setUseBottomSheet(True)
+    except Exception:
+        pass
+    entries: List[Tuple[str, Any]] = []
+    for opt in options:
+        if isinstance(opt, tuple):
+            entries.append((str(opt[0]), opt[1]))
+        else:
+            entries.append((str(opt), opt))
+
+    def handle(index: int):
+        if 0 <= index < len(entries) and on_select:
+            on_select(entries[index][1])
+
+    builder.setItems([e[0] for e in entries], Callback1(handle))
+    builder.setNegativeButton("Закрыть", None)
+    builder.show()
+
+
+def copy_to_clipboard(text: str, label: str = "AltyLib"):
+    try:
+        Utilities.copyToClipboard(text)
+        snackbar_info(f"Скопировано: {label}")
+    except Exception:
+        log(f"copy_to_clipboard failed: {traceback.format_exc().rstrip()}")
+
+
+# === Notification observers =========================================================
+
+
+_NOTIFICATION_LOCK = threading.RLock()
+_NOTIFICATION_OBSERVERS: List[Tuple[Any, Any, int]] = []
+
+
+def _notification_delegate_base():
+    NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
+    return NotificationCenter
+
+
+def _make_delegate(event_id: int, callback: Callable[[int, Any], None]):
+    NotificationCenter = _notification_delegate_base()
+    Delegate = NotificationCenter.NotificationCenterDelegate
+
+    class Observer(dynamic_proxy(Delegate)):
+        def __init__(self, cb):
+            super().__init__()
+            self.cb = cb
+
+        def didReceivedNotification(self, event, account, args):  # type: ignore[override]
+            if event == event_id:
+                try:
+                    self.cb(account, args)
+                except Exception:
+                    log(f"Notification observer error: {traceback.format_exc().rstrip()}")
+
+    return Observer(callback)
+
+
+def _clear_notification_observers():
+    with _NOTIFICATION_LOCK:
+        for center, delegate, event_id in list(_NOTIFICATION_OBSERVERS):
+            try:
+                center.removeObserver(delegate, event_id)
+            except Exception:
+                pass
+        _NOTIFICATION_OBSERVERS.clear()
+
+
+atexit.register(_clear_notification_observers)
+
+
+def on(event_name: str, *, account: int = 0):
+    """Decorator registering NotificationCenter observer."""
+
+    def decorator(func: Callable[[Any], None]):
+        NotificationCenter = _notification_delegate_base()
+        event_id = getattr(NotificationCenter, event_name, None)
+        if event_id is None:
+            raise ValueError(f"NotificationCenter has no event '{event_name}'")
+        center = NotificationCenter.getInstance(account)
+        params = list(inspect.signature(func).parameters.values())
+        if len(params) >= 2:
+            delegate = _make_delegate(event_id, lambda acc, args: func(acc, args))
+        else:
+            delegate = _make_delegate(event_id, lambda acc, args: func(args))
+        try:
+            center.addObserver(delegate, event_id)
+        except Exception:
+            log(f"Failed to add observer for {event_name}: {traceback.format_exc().rstrip()}")
+            raise
+        with _NOTIFICATION_LOCK:
+            _NOTIFICATION_OBSERVERS.append((center, delegate, event_id))
+        return func
+
+    return decorator
+
+
+# === CLI Helpers ====================================================================
+
+
+PLUGIN_TEMPLATE = (
+    '"""Plugin generated by AltyLib CLI"""\n\n'
+    '__name__ = "{name}"\n'
+    '__id__ = "{plugin_id}"\n'
+    '__version__ = "0.1.0"\n'
+    '__author__ = "{author}"\n'
+    '__min_version__ = "11.9.1"\n'
+)
+
+
+def init_plugin_scaffold(path: str, *, plugin_id: Optional[str] = None, author: str = "@user") -> str:
+    plugin_id = plugin_id or f"plugin_{int(time.time())}"
+    name = plugin_id.replace("_", " ").title()
+    os.makedirs(path, exist_ok=True)
+    plugin_path = os.path.join(path, f"{plugin_id}.plugin")
+    if os.path.exists(plugin_path):
+        raise FileExistsError(plugin_path)
+    with open(plugin_path, "w", encoding="utf-8") as fp:
+        fp.write(PLUGIN_TEMPLATE.format(name=name, plugin_id=plugin_id, author=author))
+    return plugin_path
+
+
+def validate_plugin_manifest(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with open(path, "r", encoding="utf-8") as fp:
+        content = fp.read()
+    required = ["__id__", "__version__", "__min_version__"]
+    missing = [key for key in required if key not in content]
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
+    return {"path": path, "size": len(content)}
+
+
+def altylib_cli(argv: Optional[Sequence[str]] = None):
+    parser = argparse.ArgumentParser(prog="altylib", description="AltyLib helper CLI")
+    sub = parser.add_subparsers(dest="command")
+
+    init_parser = sub.add_parser("init", help="Create plugin scaffold")
+    init_parser.add_argument("path", help="Directory for new plugin")
+    init_parser.add_argument("--id", dest="plugin_id", help="Plugin identifier")
+    init_parser.add_argument("--author", default="@user", help="Author mention")
+
+    val_parser = sub.add_parser("validate", help="Validate plugin manifest")
+    val_parser.add_argument("file", help="Plugin file to check")
+
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.command == "init":
+        result = init_plugin_scaffold(args.path, plugin_id=args.plugin_id, author=args.author)
+        print(f"Created plugin scaffold at {result}")
+        return result
+    if args.command == "validate":
+        info = validate_plugin_manifest(args.file)
+        print(f"Plugin manifest OK: {info['path']} ({info['size']} bytes)")
+        return info
+    parser.print_help()
+    return None
+
+
+# === Crash diagnostics ==============================================================
+
+
+class CrashReporter:
+    def __init__(self, log_file: Optional[str] = None):
+        self.log_file = log_file or os.path.join(JsonCacheFile.cache_dir_name, "altylib_crash.log")
+        self.enabled = False
+        self._old_hook = None
+
+    def _write(self, message: str):
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        with open(self.log_file, "a", encoding="utf-8") as fp:
+            fp.write(f"[{datetime.utcnow().isoformat()}] {message}\n")
+
+    def _handle(self, exc_type, exc, tb):
+        message = "".join(traceback.format_exception(exc_type, exc, tb))
+        self._write(message)
+        snackbar_error("Произошла ошибка, сохранен отчёт")
+        if self._old_hook:
+            self._old_hook(exc_type, exc, tb)
+
+    def enable(self):
+        if self.enabled:
+            return
+        import sys
+
+        self._old_hook = sys.excepthook
+        sys.excepthook = self._handle
+        self.enabled = True
+
+    def disable(self):
+        if not self.enabled:
+            return
+        import sys
+
+        if self._old_hook:
+            sys.excepthook = self._old_hook
+        self.enabled = False
+
+
+_CRASH_REPORTER: Optional[CrashReporter] = None
+
+
+def install_crash_reporter(log_file: Optional[str] = None) -> CrashReporter:
+    global _CRASH_REPORTER
+    if _CRASH_REPORTER is None:
+        _CRASH_REPORTER = CrashReporter(log_file)
+    _CRASH_REPORTER.enable()
+    return _CRASH_REPORTER
+
+
+# === Hot reload & debug helpers =====================================================
+
+
+_HOT_RELOAD_TARGETS: set = set()
+
+
+def enable_hot_reload(*module_names: str):
+    if not module_names:
+        module_names = (__name__,)
+    _HOT_RELOAD_TARGETS.update(module_names)
+
+
+def reload_current_plugin(*module_names: str):
+    import importlib
+    import sys
+
+    targets = module_names or tuple(_HOT_RELOAD_TARGETS) or (__name__,)
+    reloaded = []
+    for module_name in targets:
+        module = sys.modules.get(module_name)
+        if not module:
+            continue
+        reloaded.append(importlib.reload(module))
+    snackbar_info("Модули перезагружены")
+    return reloaded
+
+
+# === Feature compatibility helpers ==================================================
+
+
+_FEATURE_ADAPTERS: Dict[str, Callable[[], bool]] = {}
+_FEATURE_CACHE: Dict[str, bool] = {}
+
+
+def features_register(name: str, detector: Callable[[], bool]):
+    _FEATURE_ADAPTERS[name] = detector
+    _FEATURE_CACHE.pop(name, None)
+
+
+def features_has(name: str) -> bool:
+    if name in _FEATURE_CACHE:
+        return _FEATURE_CACHE[name]
+    detector = _FEATURE_ADAPTERS.get(name)
+    if not detector:
+        return False
+    try:
+        value = bool(detector())
+    except Exception:
+        log(f"features_has: detector for {name} failed: {traceback.format_exc().rstrip()}")
+        value = False
+    _FEATURE_CACHE[name] = value
+    return value
+
+
+def features_clear_cache(name: Optional[str] = None):
+    if name:
+        _FEATURE_CACHE.pop(name, None)
+    else:
+        _FEATURE_CACHE.clear()
+
+
+# === Cookbook =======================================================================
+
+
+_COOKBOOK: Dict[str, Dict[str, Any]] = {
+    "auto_responder": {
+        "title": "Автоответчик",
+        "description": "Автоматически отвечает на входящие сообщения по шаблону.",
+        "steps": [
+            "Используйте on('didReceiveNewMessages') для получения уведомлений",
+            "Проверяйте текст сообщения и отвечайте через send_text",
+            "Настройте шаблон через SettingsRegistry.switch/list",
+        ],
+    },
+    "media_autosave": {
+        "title": "Автосохранение медиа",
+        "description": "Скачивает медиа из выбранных чатов в галерею.",
+        "steps": [
+            "Подпишитесь на события didReceiveNewMessages",
+            "Используйте download_media и save_to_gallery",
+            "Ограничьте скорость через RateLimiter",
+        ],
+    },
+    "quick_translate": {
+        "title": "Быстрый перевод",
+        "description": "Перевод текста по команде .translate",
+        "steps": [
+            "Зарегистрируйте команду через register_command",
+            "Вызывайте внешний API и кешируйте результаты в TTLCache",
+            "Отправляйте ответ через send_text",
+        ],
+    },
+}
+
+
+def list_recipes() -> Dict[str, str]:
+    return {key: value["description"] for key, value in _COOKBOOK.items()}
+
+
+def load_recipe(name: str) -> Dict[str, Any]:
+    recipe = _COOKBOOK.get(name)
+    if not recipe:
+        raise KeyError(name)
+    return recipe
