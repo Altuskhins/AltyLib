@@ -192,41 +192,41 @@ class AutoUpdater:
         self.log(f"Force stopped (id: {id(self)})")
 
     def check_for_updates(self):
-        def get_messages_callback(response, error):
-            if error is not None:
-                log(f"Auto update task of plugin (id: {task.plugin_id}) has invalid message. Removing task")
-                self.remove_task(task)
-                return
-
-            msg = get_message(response.messages, task.message_id)
-            if not is_valid_plugin_message(msg):
-                log(f"Auto update task of plugin (id: {task.plugin_id}) has invalid message (invalid/no document attached). Removing task")
-                self.remove_task(task)
-                return
-
-            disable_ts_check = setting_getter("disable_ts_check", DEFAULT_EDIT_TIMESTAMP_CHECK)
-            if not disable_ts_check:
-                msg_edited_ts = self.msg_edited_ts_cache.content.get(task.plugin_id)
-                if msg.edit_date == msg_edited_ts:
-                    self.log((
-                        "The message with plugin attachment has not been updated since the "
-                        f"last parse. Skipping plugin (id: {task.plugin_id}) update"
-                    ))
+        for task in list(self.tasks):  # iterate copy of self.tasks to prevent RuntimeError
+            def get_messages_callback(response, error, task=task):
+                if error is not None:
+                    log(f"Auto update task of plugin (id: {task.plugin_id}) has invalid message. Removing task")
+                    self.remove_task(task)
                     return
 
-            log(f"Executing auto update of plugin (id: {task.plugin_id})")
+                msg = get_message(response.messages, task.message_id)
+                if not is_valid_plugin_message(msg):
+                    log(f"Auto update task of plugin (id: {task.plugin_id}) has invalid message (invalid/no document attached). Removing task")
+                    self.remove_task(task)
+                    return
 
-            file_loader = get_file_loader()
-            document = msg.media.getDocument()
-            path = file_loader.getPathToAttach(document, True)
+                disable_ts_check = setting_getter("disable_ts_check", DEFAULT_EDIT_TIMESTAMP_CHECK)
+                if not disable_ts_check:
+                    msg_edited_ts = self.msg_edited_ts_cache.content.get(task.plugin_id)
+                    if msg.edit_date == msg_edited_ts:
+                        self.log((
+                            "The message with plugin attachment has not been updated since the "
+                            f"last parse. Skipping plugin (id: {task.plugin_id}) update"
+                        ))
+                        return
 
-            if path.exists():
-                self.msg_edited_ts_cache.content[task.plugin_id] = msg.edit_date
-                self.msg_edited_ts_cache.write()
+                log(f"Executing auto update of plugin (id: {task.plugin_id})")
 
-            run_on_ui_thread(lambda: download_and_install_plugin(msg))
+                file_loader = get_file_loader()
+                document = msg.media.getDocument()
+                path = file_loader.getPathToAttach(document, True)
 
-        for task in list(self.tasks):  # iterate copy of self.tasks to prevent RuntimeError
+                if path.exists():
+                    self.msg_edited_ts_cache.content[task.plugin_id] = msg.edit_date
+                    self.msg_edited_ts_cache.write()
+
+                run_on_ui_thread(lambda: download_and_install_plugin(msg))
+
             get_messages(task.channel_id, task.channel_username, get_messages_callback)
 
     def is_task_already_present(self, task: UpdaterTask):
